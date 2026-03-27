@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2020 Mike Fährmann
+# Copyright 2019-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,8 +9,7 @@
 """Extractors for https://www.mangoxo.com/"""
 
 from .common import Extractor, Message
-from .. import text, exception
-from ..cache import cache
+from .. import text
 import hashlib
 import time
 
@@ -19,26 +18,26 @@ class MangoxoExtractor(Extractor):
     """Base class for mangoxo extractors"""
     category = "mangoxo"
     root = "https://www.mangoxo.com"
-    cookiedomain = "www.mangoxo.com"
-    cookienames = ("SESSION",)
+    cookies_domain = "www.mangoxo.com"
+    cookies_names = ("SESSION",)
     _warning = True
 
     def login(self):
         username, password = self._get_auth_info()
         if username:
-            self._update_cookies(self._login_impl(username, password))
+            self.cookies_update(self.cache(
+                self._login_impl, username, password, _exp=3*3600, _mem=False))
         elif MangoxoExtractor._warning:
             MangoxoExtractor._warning = False
             self.log.warning("Unauthenticated users cannot see "
                              "more than 5 images per album")
 
-    @cache(maxage=3*3600, keyarg=1)
     def _login_impl(self, username, password):
         self.log.info("Logging in as %s", username)
 
         url = self.root + "/login"
         page = self.request(url).text
-        token = text.extract(page, 'id="loginToken" value="', '"')[0]
+        token = text.extr(page, 'id="loginToken" value="', '"')
 
         url = self.root + "/api/login"
         headers = {
@@ -50,11 +49,10 @@ class MangoxoExtractor(Extractor):
 
         data = response.json()
         if str(data.get("result")) != "1":
-            raise exception.AuthenticationError(data.get("msg"))
-        return {"SESSION": self.session.cookies.get("SESSION")}
+            raise self.exc.AuthenticationError(data.get("msg"))
+        return {"SESSION": self.cookies.get("SESSION")}
 
-    @staticmethod
-    def _sign_by_md5(username, password, token):
+    def _sign_by_md5(self, username, password, token):
         # https://dns.mangoxo.com/libs/plugins/phoenix-ui/js/phoenix-ui.js
         params = [
             ("username" , username),
@@ -68,8 +66,7 @@ class MangoxoExtractor(Extractor):
         params.append(("sign", sign.upper()))
         return params
 
-    @staticmethod
-    def _total_pages(page):
+    def _total_pages(self, page):
         return text.parse_int(text.extract(page, "total :", ",")[0])
 
 
@@ -80,66 +77,48 @@ class MangoxoAlbumExtractor(MangoxoExtractor):
     directory_fmt = ("{category}", "{channel[name]}", "{album[name]}")
     archive_fmt = "{album[id]}_{num}"
     pattern = r"(?:https?://)?(?:www\.)?mangoxo\.com/album/(\w+)"
-    test = ("https://www.mangoxo.com/album/lzVOv1Q9", {
-        "url": "ad921fe62663b06e7d73997f7d00646cab7bdd0d",
-        "keyword": {
-            "channel": {
-                "id": "gaxO16d8",
-                "name": "Phoenix",
-                "cover": str,
-            },
-            "album": {
-                "id": "lzVOv1Q9",
-                "name": "re:池永康晟 Ikenaga Yasunari 透出古朴",
-                "date": "dt:2019-03-22 14:42:00",
-                "description": str,
-            },
-            "id": int,
-            "num": int,
-            "count": 65,
-        },
-    })
+    example = "https://www.mangoxo.com/album/ID"
 
     def __init__(self, match):
         MangoxoExtractor.__init__(self, match)
-        self.album_id = match.group(1)
+        self.album_id = match[1]
 
     def items(self):
         self.login()
-        url = "{}/album/{}/".format(self.root, self.album_id)
+        url = f"{self.root}/album/{self.album_id}/"
         page = self.request(url).text
         data = self.metadata(page)
         imgs = self.images(url, page)
 
-        yield Message.Directory, data
+        yield Message.Directory, "", data
 
         data["extension"] = None
         for data["num"], path in enumerate(imgs, 1):
-            data["id"] = text.parse_int(text.extract(path, "=", "&")[0])
+            data["id"] = text.parse_int(text.extr(path, "=", "&"))
             url = self.root + "/external/" + path.rpartition("url=")[2]
             yield Message.Url, url, text.nameext_from_url(url, data)
 
     def metadata(self, page):
         """Return general metadata"""
         extr = text.extract_from(page)
-        title = extr('<title>', '</title>')
-        count = extr('id="pic-count">', '<')
-        cid = extr('<img alt="', '"')
+        title = extr('<img id="cover-img" alt="', '"')
+        cid = extr('href="https://www.mangoxo.com/user/', '"')
+        cname = extr('<img alt="', '"')
         cover = extr(' src="', '"')
-        cname = extr('target="_blank">', '<')
-        date = extr('</i>', '<')
+        count = extr('id="pic-count">', '<')
+        date = extr('class="fa fa-calendar"></i>', '<')
         descr = extr('<pre>', '</pre>')
 
         return {
             "channel": {
                 "id": cid,
-                "name": text.unescape(cname.strip()),
+                "name": text.unescape(cname),
                 "cover": cover,
             },
             "album": {
                 "id": self.album_id,
                 "name": text.unescape(title),
-                "date": text.parse_datetime(date.strip(), "%Y.%m.%d %H:%M"),
+                "date": self.parse_datetime(date.strip(), "%Y.%m.%d %H:%M"),
                 "description": text.unescape(descr),
             },
             "count": text.parse_int(count),
@@ -163,20 +142,16 @@ class MangoxoChannelExtractor(MangoxoExtractor):
     """Extractor for all albums on a mangoxo channel"""
     subcategory = "channel"
     pattern = r"(?:https?://)?(?:www\.)?mangoxo\.com/(\w+)/album"
-    test = ("https://www.mangoxo.com/phoenix/album", {
-        "pattern": MangoxoAlbumExtractor.pattern,
-        "range": "1-30",
-        "count": "> 20",
-    })
+    example = "https://www.mangoxo.com/USER/album"
 
     def __init__(self, match):
         MangoxoExtractor.__init__(self, match)
-        self.user = match.group(1)
+        self.user = match[1]
 
     def items(self):
         self.login()
         num = total = 1
-        url = "{}/{}/album/".format(self.root, self.user)
+        url = f"{self.root}/{self.user}/album/"
         data = {"_extractor": MangoxoAlbumExtractor}
 
         while True:

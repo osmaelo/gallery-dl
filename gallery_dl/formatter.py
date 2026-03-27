@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2021 Mike Fährmann
+# Copyright 2021-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,42 +9,45 @@
 """String formatters"""
 
 import os
-import json
+import sys
+import time
 import string
 import _string
-import datetime
 import operator
-from . import text, util
+from . import text, util, dt
 
-_CACHE = {}
-_CONVERSIONS = None
-_GLOBALS = {
-    "_env": lambda: os.environ,
-    "_now": datetime.datetime.now,
-}
+NONE = util.NONE
 
 
-def parse(format_string, default=None):
-    key = format_string, default
+def parse(format_string, default=NONE, fmt=format):
+    key = format_string, default, fmt
 
     try:
         return _CACHE[key]
     except KeyError:
         pass
 
-    cls = StringFormatter
-    if format_string.startswith("\f"):
+    if format_string and format_string[0] == "\f":
         kind, _, format_string = format_string.partition(" ")
-        kind = kind[1:]
+        try:
+            cls = _FORMATTERS[kind[1:]]
+        except KeyError:
+            import logging
+            logging.getLogger("formatter").error(
+                "Invalid formatter type '%s'", kind[1:])
+            cls = StringFormatter
+    else:
+        cls = StringFormatter
 
-        if kind == "T":
-            cls = TemplateFormatter
-        elif kind == "E":
-            cls = ExpressionFormatter
-        elif kind == "M":
-            cls = ModuleFormatter
+    try:
+        formatter = _CACHE[key] = cls(format_string, default, fmt)
+    except Exception as exc:
+        import logging
+        logging.getLogger("formatter").error(
+            "Invalid format string '%s' (%s: %s)",
+            format_string, exc.__class__.__name__, exc)
+        raise
 
-    formatter = _CACHE[key] = cls(format_string, default)
     return formatter
 
 
@@ -61,13 +64,20 @@ class StringFormatter():
     - "u": calls str.upper
     - "c": calls str.capitalize
     - "C": calls string.capwords
-    - "j". calls json.dumps
+    - "g": calls text.slugify()
+    - "j": calls json.dumps
     - "t": calls str.strip
-    - "d": calls text.parse_timestamp
-    - "U": calls urllib.parse.unescape
+    - "T": calls dt.to_ts_string()
+    - "d": calls dt.parse_ts()
+    - "s": calls str()
     - "S": calls util.to_string()
-    - "T": calls util.to_timestamü()
+    - "U": calls urllib.parse.unescape
+    - "r": calls repr()
+    - "a": calls ascii()
     - Example: {f!l} -> "example"; {f!u} -> "EXAMPLE"
+
+    # Go to _CONVERSIONS and _SPECIFIERS below to se all of them, read:
+    # https://github.com/mikf/gallery-dl/blob/master/docs/formatting.md
 
     Extra Format Specifiers:
     - "?<before>/<after>/":
@@ -91,8 +101,9 @@ class StringFormatter():
         Example: {f:R /_/} -> "f_o_o_b_a_r" (if "f" is "f o o b a r")
     """
 
-    def __init__(self, format_string, default=None):
+    def __init__(self, format_string, default=NONE, fmt=format):
         self.default = default
+        self.format = fmt
         self.result = []
         self.fields = []
 
@@ -113,6 +124,8 @@ class StringFormatter():
             else:
                 self.format_map = lambda _: format_string
             del self.result, self.fields
+        elif fmt is not format:
+            self.format_map = self.format_map_safe
 
     def format_map(self, kwdict):
         """Apply 'kwdict' to the initial format_string and return its result"""
@@ -121,8 +134,15 @@ class StringFormatter():
             result[index] = func(kwdict)
         return "".join(result)
 
+    def format_map_safe(self, kwdict):
+        """Like 'format_map', but ensures all items are 'str'"""
+        result = self.result
+        for index, func in self.fields:
+            result[index] = str(func(kwdict))
+        return "".join(result)
+
     def _field_access(self, field_name, format_spec, conversion):
-        fmt = parse_format_spec(format_spec, conversion)
+        fmt = self._parse_format_spec(format_spec, conversion)
 
         if "|" in field_name:
             return self._apply_list([
@@ -131,37 +151,32 @@ class StringFormatter():
             ], fmt)
         else:
             key, funcs = parse_field_name(field_name)
-            if key in _GLOBALS:
-                return self._apply_globals(_GLOBALS[key], funcs, fmt)
-            if funcs:
-                return self._apply(key, funcs, fmt)
-            return self._apply_simple(key, fmt)
+            return self._apply(key, funcs, fmt)
 
     def _apply(self, key, funcs, fmt):
-        def wrap(kwdict):
-            try:
-                obj = kwdict[key]
-                for func in funcs:
-                    obj = func(obj)
-            except Exception:
-                obj = self.default
-            return fmt(obj)
-        return wrap
-
-    def _apply_globals(self, gobj, funcs, fmt):
-        def wrap(_):
-            try:
-                obj = gobj()
-                for func in funcs:
-                    obj = func(obj)
-            except Exception:
-                obj = self.default
-            return fmt(obj)
-        return wrap
-
-    def _apply_simple(self, key, fmt):
-        def wrap(kwdict):
-            return fmt(kwdict[key] if key in kwdict else self.default)
+        if key in _GLOBALS:
+            def wrap(_):
+                try:
+                    obj = gobj()
+                    for func in funcs:
+                        obj = func(obj)
+                except Exception:
+                    obj = self.default
+                return fmt(obj)
+            gobj = _GLOBALS[key]
+        elif funcs:
+            def wrap(kwdict):
+                try:
+                    obj = kwdict[key]
+                    for func in funcs:
+                        obj = func(obj)
+                except Exception:
+                    obj = self.default
+                return fmt(obj)
+        else:
+            def wrap(kwdict):
+                return fmt(kwdict[key] if key in kwdict else self.default)
+            del funcs
         return wrap
 
     def _apply_list(self, lst, fmt):
@@ -174,55 +189,133 @@ class StringFormatter():
                     if obj:
                         break
                 except Exception:
-                    pass
+                    obj = None
             else:
-                obj = self.default
+                if obj is None:
+                    obj = self.default
             return fmt(obj)
         return wrap
 
+    def _parse_format_spec(self, format_spec, conversion):
+        fmt = _build_format_func(format_spec, self.format)
+        if not conversion:
+            return fmt
 
-class TemplateFormatter(StringFormatter):
-    """Read format_string from file"""
-
-    def __init__(self, path, default=None):
-        with open(util.expand_path(path)) as fp:
-            format_string = fp.read()
-        StringFormatter.__init__(self, format_string, default)
+        conversion = _CONVERSIONS[conversion]
+        if fmt is self.format:
+            return conversion
+        else:
+            return lambda obj: fmt(conversion(obj))
 
 
 class ExpressionFormatter():
     """Generate text by evaluating a Python expression"""
 
-    def __init__(self, expression, default=None):
+    def __init__(self, expression, default=NONE, fmt=None):
         self.format_map = util.compile_expression(expression)
+
+
+class FStringFormatter():
+    """Generate text by evaluating an f-string literal"""
+
+    def __init__(self, fstring, default=NONE, fmt=None):
+        self.format_map = util.compile_expression(f'f"""{fstring}"""')
+
+
+def _init_jinja():
+    import jinja2
+    from . import config
+
+    if opts := config.get((), "jinja"):
+        JinjaFormatter.env = env = jinja2.Environment(
+            **opts.get("environment") or {})
+    else:
+        JinjaFormatter.env = jinja2.Environment()
+        return
+
+    if policies := opts.get("policies"):
+        env.policies.update(policies)
+
+    if path := opts.get("filters"):
+        module = util.import_file(path).__dict__
+        env.filters.update(
+            module["__filters__"] if "__filters__" in module else module)
+
+    if path := opts.get("tests"):
+        module = util.import_file(path).__dict__
+        env.tests.update(
+            module["__tests__"] if "__tests__" in module else module)
+
+
+class JinjaFormatter():
+    """Generate text by evaluating a Jinja template string"""
+    env = None
+
+    def __init__(self, source, default=NONE, fmt=None):
+        if self.env is None:
+            _init_jinja()
+        self.format_map = self.env.from_string(source).render
 
 
 class ModuleFormatter():
     """Generate text by calling an external function"""
 
-    def __init__(self, function_spec, default=None):
-        module_name, _, function_name = function_spec.partition(":")
-        module = __import__(module_name)
+    def __init__(self, function_spec, default=NONE, fmt=None):
+        module_name, _, function_name = function_spec.rpartition(":")
+        module = util.import_file(module_name)
         self.format_map = getattr(module, function_name)
 
 
+class TemplateFormatter(StringFormatter):
+    """Read format_string from file"""
+
+    def __init__(self, path, default=NONE, fmt=format):
+        with open(util.expand_path(path), encoding="utf-8") as fp:
+            format_string = fp.read()
+        StringFormatter.__init__(self, format_string, default, fmt)
+
+
+class TemplateFStringFormatter(FStringFormatter):
+    """Read f-string from file"""
+
+    def __init__(self, path, default=NONE, fmt=None):
+        with open(util.expand_path(path), encoding="utf-8") as fp:
+            fstring = fp.read()
+        FStringFormatter.__init__(self, fstring, default, fmt)
+
+
+class TemplateJinjaFormatter(JinjaFormatter):
+    """Generate text by evaluating a Jinja template"""
+
+    def __init__(self, path, default=NONE, fmt=None):
+        with open(util.expand_path(path), encoding="utf-8") as fp:
+            source = fp.read()
+        JinjaFormatter.__init__(self, source, default, fmt)
+
+
 def parse_field_name(field_name):
+    if field_name[0] == "'":
+        return "_lit", (operator.itemgetter(field_name[1:-1]),)
+
     first, rest = _string.formatter_field_name_split(field_name)
     funcs = []
 
     for is_attr, key in rest:
         if is_attr:
-            func = operator.attrgetter
+            func = _attrgetter
         else:
             func = operator.itemgetter
             try:
                 if ":" in key:
-                    start, _, stop = key.partition(":")
-                    stop, _, step = stop.partition(":")
-                    start = int(start) if start else None
-                    stop = int(stop) if stop else None
-                    step = int(step) if step else None
-                    key = slice(start, stop, step)
+                    if key[0] == "b":
+                        func = _bytesgetter
+                        key = _slice(key[1:])
+                    else:
+                        key = _slice(key)
+                elif key[0] == "-":
+                    key = int(key)
+                else:
+                    key = key.strip("\"'")
             except TypeError:
                 pass  # key is an integer
 
@@ -231,95 +324,323 @@ def parse_field_name(field_name):
     return first, funcs
 
 
-def parse_format_spec(format_spec, conversion):
-    fmt = build_format_func(format_spec)
-    if not conversion:
-        return fmt
-
-    global _CONVERSIONS
-    if _CONVERSIONS is None:
-        _CONVERSIONS = {
-            "l": str.lower,
-            "u": str.upper,
-            "c": str.capitalize,
-            "C": string.capwords,
-            "j": json.dumps,
-            "t": str.strip,
-            "T": util.to_timestamp,
-            "d": text.parse_timestamp,
-            "U": text.unescape,
-            "S": util.to_string,
-            "s": str,
-            "r": repr,
-            "a": ascii,
-        }
-
-    conversion = _CONVERSIONS[conversion]
-    if fmt is format:
-        return conversion
-    else:
-        def chain(obj):
-            return fmt(conversion(obj))
-        return chain
+def _slice(indices):
+    start, _, stop = indices.partition(":")
+    stop, _, step = stop.partition(":")
+    return slice(
+        int(start) if start else None,
+        int(stop) if stop else None,
+        int(step) if step else None,
+    )
 
 
-def build_format_func(format_spec):
+def _attrgetter(key):
+
+    if key.isdecimal() or key[0] == "-":
+        try:
+            return operator.itemgetter(int(key))
+        except ValueError:
+            pass
+
+    def apply_key(obj):
+        try:
+            return obj[key]
+        except (TypeError, KeyError):
+            return getattr(obj, key)
+    return apply_key
+
+
+def _bytesgetter(slice):
+
+    def apply_slice_bytes(obj):
+        return obj.encode(_ENCODING)[slice].decode(_ENCODING, "ignore")
+
+    return apply_slice_bytes
+
+
+def _build_format_func(format_spec, default):
     if format_spec:
-        fmt = format_spec[0]
-        if fmt == "?":
-            return _parse_optional(format_spec)
-        if fmt == "L":
-            return _parse_maxlen(format_spec)
-        if fmt == "J":
-            return _parse_join(format_spec)
-        if fmt == "R":
-            return _parse_replace(format_spec)
-        return _default_format(format_spec)
-    return format
+        return _FORMAT_SPECIFIERS.get(
+            format_spec[0], _default_format)(format_spec, default)
+    return default
 
 
-def _parse_optional(format_spec):
-    before, after, format_spec = format_spec.split("/", 2)
+def _parse_optional(format_spec, default):
+    before, after, format_spec = format_spec.split(_SEPARATOR, 2)
     before = before[1:]
-    fmt = build_format_func(format_spec)
+    fmt = _build_format_func(format_spec, default)
 
     def optional(obj):
-        return before + fmt(obj) + after if obj else ""
+        return f"{before}{fmt(obj)}{after}" if obj else ""
     return optional
 
 
-def _parse_maxlen(format_spec):
-    maxlen, replacement, format_spec = format_spec.split("/", 2)
-    maxlen = text.parse_int(maxlen[1:])
-    fmt = build_format_func(format_spec)
+def _parse_slice(format_spec, default):
+    indices, _, format_spec = format_spec.partition("]")
+    fmt = _build_format_func(format_spec, default)
 
-    def mlen(obj):
-        obj = fmt(obj)
-        return obj if len(obj) <= maxlen else replacement
+    if indices[1] == "b":
+        slice_bytes = _bytesgetter(_slice(indices[2:]))
+
+        def apply_slice(obj):
+            return fmt(slice_bytes(obj))
+
+    else:
+        slice = _slice(indices[1:])
+
+        def apply_slice(obj):
+            return fmt(obj[slice])
+
+    return apply_slice
+
+
+def _parse_arithmetic(format_spec, default):
+    op, _, format_spec = format_spec.partition(_SEPARATOR)
+    fmt = _build_format_func(format_spec, default)
+
+    value = int(op[2:])
+    op = op[1]
+
+    if op == "+":
+        return lambda obj: fmt(obj + value)
+    if op == "-":
+        return lambda obj: fmt(obj - value)
+    if op == "*":
+        return lambda obj: fmt(obj * value)
+
+    return fmt
+
+
+def _parse_conversion(format_spec, default):
+    conversions, _, format_spec = format_spec.partition(_SEPARATOR)
+    convs = [_CONVERSIONS[c] for c in conversions[1:]]
+    fmt = _build_format_func(format_spec, default)
+
+    if len(conversions) <= 2:
+
+        def convert_one(obj):
+            return fmt(conv(obj))
+        conv = _CONVERSIONS[conversions[1]]
+        return convert_one
+
+    def convert_many(obj):
+        for conv in convs:
+            obj = conv(obj)
+        return fmt(obj)
+    convs = [_CONVERSIONS[c] for c in conversions[1:]]
+    return convert_many
+
+
+def _parse_maxlen(format_spec, default):
+    maxlen, replacement, format_spec = format_spec.split(_SEPARATOR, 2)
+    fmt = _build_format_func(format_spec, default)
+
+    if maxlen[1] == "b":
+        maxlen = text.parse_int(maxlen[2:])
+
+        def mlen(obj):
+            obj = fmt(obj)
+            return obj if len(obj.encode(_ENCODING)) <= maxlen else replacement
+    else:
+        maxlen = text.parse_int(maxlen[1:])
+
+        def mlen(obj):
+            obj = fmt(obj)
+            return obj if len(obj) <= maxlen else replacement
     return mlen
 
 
-def _parse_join(format_spec):
-    separator, _, format_spec = format_spec.partition("/")
-    separator = separator[1:]
-    fmt = build_format_func(format_spec)
-
-    def join(obj):
-        return fmt(separator.join(obj))
-    return join
+def _parse_identity(format_spec, default):
+    return util.identity
 
 
-def _parse_replace(format_spec):
-    old, new, format_spec = format_spec.split("/", 2)
+def _parse_join(format_spec, default):
+    separator, _, format_spec = format_spec.partition(_SEPARATOR)
+    join = separator[1:].join
+    fmt = _build_format_func(format_spec, default)
+
+    def apply_join(obj):
+        if isinstance(obj, str):
+            return fmt(obj)
+        return fmt(join(obj))
+    return apply_join
+
+
+def _parse_map(format_spec, default):
+    key, _, format_spec = format_spec.partition(_SEPARATOR)
+    key = key[1:]
+    fmt = _build_format_func(format_spec, default)
+
+    def map_(obj):
+        if not obj or isinstance(obj, str):
+            return fmt(obj)
+
+        results = []
+        for item in obj:
+            if isinstance(item, dict):
+                value = item.get(key, ...)
+                results.append(default if value is ... else value)
+            else:
+                results.append(item)
+        return fmt(results)
+
+    return map_
+
+
+def _parse_replace(format_spec, default):
+    old, new, format_spec = format_spec.split(_SEPARATOR, 2)
     old = old[1:]
-    fmt = build_format_func(format_spec)
+    fmt = _build_format_func(format_spec, default)
 
     def replace(obj):
         return fmt(obj.replace(old, new))
     return replace
 
 
-def _default_format(format_spec):
+def _parse_datetime(format_spec, default):
+    dt_format, _, format_spec = format_spec.partition(_SEPARATOR)
+    dt_format = dt_format[1:]
+    fmt = _build_format_func(format_spec, default)
+
+    def dt_parse(obj):
+        return fmt(dt.parse(obj, dt_format))
+    return dt_parse
+
+
+def _parse_offset(format_spec, default):
+    offset, _, format_spec = format_spec.partition(_SEPARATOR)
+    offset = offset[1:]
+    fmt = _build_format_func(format_spec, default)
+
+    if not offset or offset == "local":
+        def off(dt_utc):
+            local = time.localtime(dt.to_ts(dt_utc))
+            return fmt(dt_utc + dt.timedelta(0, local.tm_gmtoff))
+    else:
+        hours, _, minutes = offset.partition(":")
+        offset = 3600 * int(hours)
+        if minutes:
+            offset += 60 * (int(minutes) if offset > 0 else -int(minutes))
+        offset = dt.timedelta(0, offset)
+
+        def off(obj):
+            return fmt(obj + offset)
+    return off
+
+
+def _parse_sort(format_spec, default):
+    args, _, format_spec = format_spec.partition(_SEPARATOR)
+    fmt = _build_format_func(format_spec, default)
+
+    if "d" in args or "r" in args:
+        def sort(obj):
+            return fmt(sorted(obj, reverse=True))
+    else:
+        def sort(obj):
+            return fmt(sorted(obj))
+    return sort
+
+
+def _parse_limit(format_spec, default):
+    limit, hint, format_spec = format_spec.split(_SEPARATOR, 2)
+    fmt = _build_format_func(format_spec, default)
+
+    if limit[1] == "b":
+        hint = hint.encode(_ENCODING)
+        limit = int(limit[2:])
+        limit_hint = limit - len(hint)
+
+        def apply_limit(obj):
+            objb = obj.encode(_ENCODING)
+            if len(objb) > limit:
+                obj = (objb[:limit_hint] + hint).decode(_ENCODING, "ignore")
+            return fmt(obj)
+    else:
+        limit = int(limit[1:])
+        limit_hint = limit - len(hint)
+
+        def apply_limit(obj):
+            if len(obj) > limit:
+                obj = obj[:limit_hint] + hint
+            return fmt(obj)
+    return apply_limit
+
+
+def _default_format(format_spec, default):
     def wrap(obj):
         return format(obj, format_spec)
     return wrap
+
+
+class Literal():
+    # __getattr__, __getattribute__, and __class_getitem__
+    # are all slower than regular __getitem__
+
+    def __getitem__(self, key):
+        return key
+
+
+_literal = Literal()
+
+_CACHE = {}
+_ENCODING = sys.getfilesystemencoding()
+_SEPARATOR = "/"
+_FORMATTERS = {
+    "E" : ExpressionFormatter,
+    "F" : FStringFormatter,
+    "J" : JinjaFormatter,
+    "M" : ModuleFormatter,
+    "S" : StringFormatter,
+    "T" : TemplateFormatter,
+    "TF": TemplateFStringFormatter,
+    "FT": TemplateFStringFormatter,
+    "TJ": TemplateJinjaFormatter,
+    "JT": TemplateJinjaFormatter,
+}
+_GLOBALS = {
+    "_env": lambda: os.environ,
+    "_lit": lambda: _literal,
+    "_now": dt.datetime.now,
+    "_nul": lambda: util.NONE,
+}
+_CONVERSIONS = {
+    "l": str.lower,
+    "u": str.upper,
+    "c": str.capitalize,
+    "C": string.capwords,
+    "j": util.json_dumps,
+    "t": str.strip,
+    "n": len,
+    "L": util.code_to_language,
+    "T": dt.to_ts_string,
+    "d": dt.parse_ts,
+    "D": dt.convert,
+    "q": text.quote,
+    "Q": text.unquote,
+    "U": text.unescape,
+    "H": lambda s: text.unescape(text.remove_html(s)),
+    "g": text.slugify,
+    "R": text.extract_urls,
+    "W": text.sanitize_whitespace,
+    "S": util.to_string,
+    "s": str,
+    "r": repr,
+    "a": ascii,
+    "i": int,
+    "f": float,
+}
+_FORMAT_SPECIFIERS = {
+    "?": _parse_optional,
+    "[": _parse_slice,
+    "A": _parse_arithmetic,
+    "C": _parse_conversion,
+    "D": _parse_datetime,
+    "I": _parse_identity,
+    "J": _parse_join,
+    "L": _parse_maxlen,
+    "M": _parse_map,
+    "O": _parse_offset,
+    "R": _parse_replace,
+    "S": _parse_sort,
+    "X": _parse_limit,
+}

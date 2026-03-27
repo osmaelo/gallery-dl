@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2021 Mike Fährmann
+# Copyright 2019-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,8 +9,7 @@
 """Extractors for Mastodon instances"""
 
 from .common import BaseExtractor, Message
-from .. import text, exception
-from ..cache import cache
+from .. import text
 
 
 class MastodonExtractor(BaseExtractor):
@@ -19,18 +18,22 @@ class MastodonExtractor(BaseExtractor):
     directory_fmt = ("mastodon", "{instance}", "{account[username]}")
     filename_fmt = "{category}_{id}_{media[id]}.{extension}"
     archive_fmt = "{media[id]}"
-    cookiedomain = None
 
     def __init__(self, match):
         BaseExtractor.__init__(self, match)
+        self.item = self.groups[-1]
+
+    def _init(self):
         self.instance = self.root.partition("://")[2]
-        self.item = match.group(match.lastindex)
         self.reblogs = self.config("reblogs", False)
         self.replies = self.config("replies", True)
+        self.cards = self.config("cards", False)
 
     def items(self):
         for status in self.statuses():
 
+            if self._check_moved:
+                self._check_moved(status["account"])
             if not self.reblogs and status["reblog"]:
                 self.log.debug("Skipping %s (reblog)", status["id"])
                 continue
@@ -41,13 +44,29 @@ class MastodonExtractor(BaseExtractor):
             attachments = status["media_attachments"]
             del status["media_attachments"]
 
-            status["instance"] = self.instance
-            status["tags"] = [tag["name"] for tag in status["tags"]]
-            status["date"] = text.parse_datetime(
-                status["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
+            if status["reblog"]:
+                attachments.extend(status["reblog"]["media_attachments"])
 
-            yield Message.Directory, status
-            for media in attachments:
+            if self.cards:
+                if card := status.get("card"):
+                    if url := card.get("image"):
+                        card["weburl"] = card.get("url")
+                        card["url"] = url
+                        card["id"] = "card" + "".join(
+                            url.split("/")[6:-2]).lstrip("0")
+                        attachments.append(card)
+
+            status["instance"] = self.instance
+            acct = status["account"]["acct"]
+            status["instance_remote"] = \
+                acct.rpartition("@")[2] if "@" in acct else None
+
+            status["count"] = len(attachments)
+            status["tags"] = [tag["name"] for tag in status["tags"]]
+            status["date"] = self.parse_datetime_iso(status["created_at"][:19])
+
+            yield Message.Directory, "", status
+            for status["num"], media in enumerate(attachments, 1):
                 status["media"] = media
                 url = media["url"]
                 yield Message.Url, url, text.nameext_from_url(url, status)
@@ -56,16 +75,28 @@ class MastodonExtractor(BaseExtractor):
         """Return an iterable containing all relevant Status objects"""
         return ()
 
+    def _check_moved(self, account):
+        self._check_moved = None
+        # Certain fediverse software (such as Iceshrimp and Sharkey) have a
+        # null account "moved" field instead of not having it outright.
+        # To handle this, check if the "moved" value is truthy instead
+        # if only it exists.
+        if account.get("moved"):
+            self.log.warning("Account '%s' moved to '%s'",
+                             account["acct"], account["moved"]["acct"])
 
-INSTANCES = {
+
+BASE_PATTERN = MastodonExtractor.update({
     "mastodon.social": {
         "root"         : "https://mastodon.social",
+        "pattern"      : r"mastodon\.social",
         "access-token" : "Y06R36SMvuXXN5_wiPKFAEFiQaMSQg0o_hGgc86Jj48",
         "client-id"    : "dBSHdpsnOUZgxOnjKSQrWEPakO3ctM7HmsyoOd4FcRo",
         "client-secret": "DdrODTHs_XoeOsNVXnILTMabtdpWrWOAtrmw91wU1zI",
     },
     "pawoo": {
         "root"         : "https://pawoo.net",
+        "pattern"      : r"pawoo\.net",
         "access-token" : "c12c9d275050bce0dc92169a28db09d7"
                          "0d62d0a75a8525953098c167eacd3668",
         "client-id"    : "978a25f843ec01e53d09be2c290cd75c"
@@ -75,59 +106,79 @@ INSTANCES = {
     },
     "baraag": {
         "root"         : "https://baraag.net",
+        "pattern"      : r"baraag\.net",
         "access-token" : "53P1Mdigf4EJMH-RmeFOOSM9gdSDztmrAYFgabOKKE0",
         "client-id"    : "czxx2qilLElYHQ_sm-lO8yXuGwOHxLX9RYYaD0-nq1o",
         "client-secret": "haMaFdMBgK_-BIxufakmI2gFgkYjqmgXGEO2tB-R2xY",
     }
-}
-
-BASE_PATTERN = MastodonExtractor.update(INSTANCES)
+}) + "(?:/web)?"
 
 
 class MastodonUserExtractor(MastodonExtractor):
     """Extractor for all images of an account/user"""
     subcategory = "user"
     pattern = BASE_PATTERN + r"/(?:@|users/)([^/?#]+)(?:/media)?/?$"
-    test = (
-        ("https://mastodon.social/@jk", {
-            "pattern": r"https://files.mastodon.social/media_attachments"
-                       r"/files/(\d+/){3,}original/\w+",
-            "range": "1-60",
-            "count": 60,
-        }),
-        ("https://pawoo.net/@yoru_nine/", {
-            "range": "1-60",
-            "count": 60,
-        }),
-        ("https://baraag.net/@pumpkinnsfw"),
-        ("https://mastodon.social/@id:10843"),
-        ("https://mastodon.social/users/id:10843"),
-        ("https://mastodon.social/users/jk"),
-    )
+    example = "https://mastodon.social/@USER"
 
     def statuses(self):
         api = MastodonAPI(self)
 
         return api.account_statuses(
             api.account_id_by_username(self.item),
-            only_media=not self.config("text-posts", False),
+            only_media=(
+                not self.reblogs and
+                not self.cards and
+                not self.config("text-posts", False)
+            ),
             exclude_replies=not self.replies,
         )
+
+
+class MastodonBookmarkExtractor(MastodonExtractor):
+    """Extractor for mastodon bookmarks"""
+    subcategory = "bookmark"
+    pattern = BASE_PATTERN + r"/bookmarks"
+    example = "https://mastodon.social/bookmarks"
+
+    def statuses(self):
+        return MastodonAPI(self).account_bookmarks()
+
+
+class MastodonFavoriteExtractor(MastodonExtractor):
+    """Extractor for mastodon favorites"""
+    subcategory = "favorite"
+    pattern = BASE_PATTERN + r"/favourites"
+    example = "https://mastodon.social/favourites"
+
+    def statuses(self):
+        return MastodonAPI(self).account_favorites()
+
+
+class MastodonListExtractor(MastodonExtractor):
+    """Extractor for mastodon lists"""
+    subcategory = "list"
+    pattern = BASE_PATTERN + r"/lists/(\w+)"
+    example = "https://mastodon.social/lists/12345"
+
+    def statuses(self):
+        return MastodonAPI(self).timelines_list(self.item)
+
+
+class MastodonHashtagExtractor(MastodonExtractor):
+    """Extractor for mastodon hashtags"""
+    subcategory = "hashtag"
+    pattern = BASE_PATTERN + r"/tags/(\w+)"
+    example = "https://mastodon.social/tags/NAME"
+
+    def statuses(self):
+        return MastodonAPI(self).timelines_tag(self.item)
 
 
 class MastodonFollowingExtractor(MastodonExtractor):
     """Extractor for followed mastodon users"""
     subcategory = "following"
-    pattern = BASE_PATTERN + r"/users/([^/?#]+)/following"
-    test = (
-        ("https://mastodon.social/users/0x4f/following", {
-            "extractor": False,
-            "count": ">= 20",
-        }),
-        ("https://mastodon.social/users/id:10843/following"),
-        ("https://pawoo.net/users/yoru_nine/following"),
-        ("https://baraag.net/users/pumpkinnsfw/following"),
-    )
+    pattern = BASE_PATTERN + r"/(?:@|users/)([^/?#]+)/following"
+    example = "https://mastodon.social/@USER/following"
 
     def items(self):
         api = MastodonAPI(self)
@@ -141,20 +192,15 @@ class MastodonFollowingExtractor(MastodonExtractor):
 class MastodonStatusExtractor(MastodonExtractor):
     """Extractor for images from a status"""
     subcategory = "status"
-    pattern = BASE_PATTERN + r"/@[^/?#]+/(\d+)"
-    test = (
-        ("https://mastodon.social/@jk/103794036899778366", {
-            "count": 4,
-        }),
-        ("https://pawoo.net/@yoru_nine/105038878897832922", {
-            "content": "b52e807f8ab548d6f896b09218ece01eba83987a",
-        }),
-        ("https://baraag.net/@pumpkinnsfw/104364170556898443", {
-            "content": "67748c1b828c58ad60d0fe5729b59fb29c872244",
-        }),
-    )
+    pattern = (BASE_PATTERN + r"/(?:@[^/?#]+|(?:users/[^/?#]+/)?"
+               r"(?:statuses|notice|objects()))/(?!following)([^/?#]+)")
+    example = "https://mastodon.social/@USER/12345"
 
     def statuses(self):
+        if self.groups[-2] is not None:
+            url = f"{self.root}/objects/{self.item}"
+            location = self.request_location(url)
+            self.item = location.rpartition("/")[2]
         return (MastodonAPI(self).status(self.item),)
 
 
@@ -168,53 +214,90 @@ class MastodonAPI():
     def __init__(self, extractor):
         self.root = extractor.root
         self.extractor = extractor
+        self.exc = extractor.exc
 
         access_token = extractor.config("access-token")
         if access_token is None or access_token == "cache":
-            access_token = _access_token_cache(extractor.instance)
+            access_token = self.extractor.cache(
+                _access_token_cache, extractor.instance, _mem=False)
         if not access_token:
-            try:
-                access_token = INSTANCES[extractor.category]["access-token"]
-            except (KeyError, TypeError):
-                raise exception.StopExtraction(
-                    "Missing access token.\n"
-                    "Run 'gallery-dl oauth:mastodon:%s' to obtain one.",
-                    extractor.instance)
+            access_token = extractor.config_instance("access-token")
 
-        self.headers = {"Authorization": "Bearer " + access_token}
+        if access_token:
+            self.headers = {"Authorization": "Bearer " + access_token}
+        else:
+            self.headers = None
 
     def account_id_by_username(self, username):
         if username.startswith("id:"):
             return username[3:]
 
-        handle = "@{}@{}".format(username, self.extractor.instance)
-        for account in self.account_search(handle, 1):
-            if account["username"] == username:
-                return account["id"]
-        raise exception.NotFoundError("account")
+        try:
+            return self.account_lookup(username)["id"]
+        except Exception:
+            # fall back to account search
+            pass
 
-    def account_following(self, account_id):
-        endpoint = "/v1/accounts/{}/following".format(account_id)
+        if "@" in username:
+            handle = "@" + username
+        else:
+            handle = f"@{username}@{self.extractor.instance}"
+
+        for account in self.account_search(handle, 1):
+            if account["acct"] == username:
+                self.extractor._check_moved(account)
+                return account["id"]
+        raise self.exc.NotFoundError("account")
+
+    def account_bookmarks(self):
+        """Statuses the user has bookmarked"""
+        endpoint = "/v1/bookmarks"
         return self._pagination(endpoint, None)
 
+    def account_favorites(self):
+        """Statuses the user has favourited"""
+        endpoint = "/v1/favourites"
+        return self._pagination(endpoint, None)
+
+    def account_following(self, account_id):
+        """Accounts which the given account is following"""
+        endpoint = f"/v1/accounts/{account_id}/following"
+        return self._pagination(endpoint, None)
+
+    def account_lookup(self, username):
+        """Quickly lookup a username to see if it is available"""
+        endpoint = "/v1/accounts/lookup"
+        params = {"acct": username}
+        return self._call(endpoint, params).json()
+
     def account_search(self, query, limit=40):
-        """Search for accounts"""
+        """Search for matching accounts by username or display name"""
         endpoint = "/v1/accounts/search"
         params = {"q": query, "limit": limit}
         return self._call(endpoint, params).json()
 
     def account_statuses(self, account_id, only_media=True,
                          exclude_replies=False):
-        """Fetch an account's statuses"""
-        endpoint = "/v1/accounts/{}/statuses".format(account_id)
-        params = {"only_media"     : "1" if only_media else "0",
-                  "exclude_replies": "1" if exclude_replies else "0"}
+        """Statuses posted to the given account"""
+        endpoint = f"/v1/accounts/{account_id}/statuses"
+        params = {"only_media"     : "true" if only_media else "false",
+                  "exclude_replies": "true" if exclude_replies else "false"}
         return self._pagination(endpoint, params)
 
     def status(self, status_id):
-        """Fetch a status"""
+        """Obtain information about a status"""
         endpoint = "/v1/statuses/" + status_id
         return self._call(endpoint).json()
+
+    def timelines_list(self, list_id):
+        """View statuses in the given list timeline"""
+        endpoint = "/v1/timelines/list/" + list_id
+        return self._pagination(endpoint, None)
+
+    def timelines_tag(self, hashtag):
+        """View public statuses containing the given hashtag"""
+        endpoint = "/v1/timelines/tag/" + hashtag
+        return self._pagination(endpoint, None)
 
     def _call(self, endpoint, params=None):
         if endpoint.startswith("http"):
@@ -229,15 +312,17 @@ class MastodonAPI():
 
             if code < 400:
                 return response
+            if code == 401:
+                raise self.exc.AbortExtraction(
+                    f"Invalid or missing access token.\nRun 'gallery-dl oauth:"
+                    f"mastodon:{self.extractor.instance}' to obtain one.")
             if code == 404:
-                raise exception.NotFoundError()
+                raise self.exc.NotFoundError()
             if code == 429:
-                self.extractor.wait(until=text.parse_datetime(
-                    response.headers["x-ratelimit-reset"],
-                    "%Y-%m-%dT%H:%M:%S.%fZ",
-                ))
+                self.extractor.wait(until=self.extractor.parse_datetime_iso(
+                    response.headers["x-ratelimit-reset"]))
                 continue
-            raise exception.StopExtraction(response.json().get("error"))
+            raise self.exc.AbortExtraction(response.json().get("error"))
 
     def _pagination(self, endpoint, params):
         url = endpoint
@@ -252,6 +337,5 @@ class MastodonAPI():
             params = None
 
 
-@cache(maxage=100*365*24*3600, keyarg=0)
 def _access_token_cache(instance):
     return None

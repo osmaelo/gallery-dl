@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -18,31 +18,16 @@ class FuskatorGalleryExtractor(GalleryExtractor):
     category = "fuskator"
     root = "https://fuskator.com"
     pattern = r"(?:https?://)?fuskator\.com/(?:thumbs|expanded)/([^/?#]+)"
-    test = (
-        ("https://fuskator.com/thumbs/d0GnIzXrSKU/", {
-            "pattern": r"https://i\d+.fuskator.com/large/d0GnIzXrSKU/.+\.jpg",
-            "count": 22,
-            "keyword": {
-                "gallery_id": 473023,
-                "gallery_hash": "d0GnIzXrSKU",
-                "title": "re:Shaved Brunette Babe Maria Ryabushkina with ",
-                "views": int,
-                "score": float,
-                "count": 22,
-                "tags": list,
-            },
-        }),
-        ("https://fuskator.com/expanded/gXpKzjgIidA/index.html"),
-    )
+    example = "https://fuskator.com/thumbs/ID/"
 
     def __init__(self, match):
-        self.gallery_hash = match.group(1)
-        url = "{}/thumbs/{}/".format(self.root, self.gallery_hash)
+        self.gallery_hash = match[1]
+        url = f"{self.root}/thumbs/{self.gallery_hash}/index.html"
         GalleryExtractor.__init__(self, match, url)
 
     def metadata(self, page):
         headers = {
-            "Referer"         : self.gallery_url,
+            "Referer"         : self.page_url,
             "X-Requested-With": "XMLHttpRequest",
         }
         auth = self.request(
@@ -54,26 +39,26 @@ class FuskatorGalleryExtractor(GalleryExtractor):
             "hash"  : self.gallery_hash,
             "_"     : int(time.time()),
         }
-        self.data = data = self.request(
-            self.root + "/ajax/gal.aspx", params=params, headers=headers,
-        ).json()
+        self.data = data = self.request_json(
+            self.root + "/ajax/gal.aspx", params=params, headers=headers)
 
-        title = text.extract(page, "<title>", "</title>")[0].strip()
+        title = text.extr(page, "<title>", "</title>").strip()
         title, _, gallery_id = title.rpartition("#")
 
         return {
             "gallery_id"  : text.parse_int(gallery_id),
             "gallery_hash": self.gallery_hash,
             "title"       : text.unescape(title[:-15]),
-            "views"       : data["hits"],
-            "score"       : data["rating"],
-            "tags"        : data["tags"].split(","),
-            "count"       : len(data["images"]),
+            "views"       : data.get("hits"),
+            "score"       : data.get("rating"),
+            "tags"        : (data.get("tags") or "").split(","),
         }
 
     def images(self, page):
-        for image in self.data["images"]:
-            yield "https:" + image["imageUrl"], image
+        return [
+            ("https:" + image["imageUrl"], image)
+            for image in self.data["images"]
+        ]
 
 
 class FuskatorSearchExtractor(Extractor):
@@ -82,17 +67,11 @@ class FuskatorSearchExtractor(Extractor):
     subcategory = "search"
     root = "https://fuskator.com"
     pattern = r"(?:https?://)?fuskator\.com(/(?:search|page)/.+)"
-    test = (
-        ("https://fuskator.com/search/red_swimsuit/", {
-            "pattern": FuskatorGalleryExtractor.pattern,
-            "count": ">= 40",
-        }),
-        ("https://fuskator.com/page/3/swimsuit/quality/"),
-    )
+    example = "https://fuskator.com/search/TAG/"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.path = match.group(1)
+        self.path = match[1]
 
     def items(self):
         url = self.root + self.path
@@ -104,7 +83,7 @@ class FuskatorSearchExtractor(Extractor):
                     page, 'class="pic_pad"><a href="', '"'):
                 yield Message.Queue, self.root + path, data
 
-            pages = text.extract(page, 'class="pages"><span>', '>&gt;&gt;<')[0]
+            pages = text.extr(page, 'class="pages"><span>', '>&gt;&gt;<')
             if not pages:
                 return
-            url = self.root + text.rextract(pages, 'href="', '"')[0]
+            url = self.root + text.rextr(pages, 'href="', '"')

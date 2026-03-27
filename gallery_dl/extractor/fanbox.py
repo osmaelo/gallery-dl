@@ -7,10 +7,10 @@
 """Extractors for https://www.fanbox.cc/"""
 
 from .common import Extractor, Message
-from .. import text
+from .. import text, util
 
-
-BASE_PATTERN = (
+BASE_PATTERN = r"(?:https?://)?(?:www\.)?fanbox\.cc"
+USER_PATTERN = (
     r"(?:https?://)?(?:"
     r"(?!www\.)([\w-]+)\.fanbox\.cc|"
     r"(?:www\.)?fanbox\.cc/@([\w-]+))"
@@ -18,69 +18,208 @@ BASE_PATTERN = (
 
 
 class FanboxExtractor(Extractor):
-    """Base class for Fanbox extractors"""
+    """Base class for fanbox extractors"""
     category = "fanbox"
     root = "https://www.fanbox.cc"
     directory_fmt = ("{category}", "{creatorId}")
     filename_fmt = "{id}_{num}.{extension}"
     archive_fmt = "{id}_{num}"
+    browser = "firefox"
     _warning = True
 
-    def __init__(self, match):
-        Extractor.__init__(self, match)
+    def _init(self):
+        self.headers = {
+            "Accept" : "application/json, text/plain, */*",
+            "Origin" : "https://www.fanbox.cc",
+            "Referer": "https://www.fanbox.cc/",
+            "Cookie" : None,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+        }
         self.embeds = self.config("embeds", True)
 
-    def items(self):
+        if includes := self.config("metadata"):
+            if isinstance(includes, str):
+                includes = includes.split(",")
+            elif not isinstance(includes, (list, tuple)):
+                includes = ("user", "plan")
+            self._meta_user = ("user" in includes)
+            self._meta_plan = ("plan" in includes)
+            self._meta_comments = ("comments" in includes)
+        else:
+            self._meta_user = self._meta_plan = self._meta_comments = False
+
+        if self.config("comments"):
+            self._meta_comments = True
 
         if self._warning:
-            if "FANBOXSESSID" not in self.session.cookies:
+            if not self.cookies_check(("FANBOXSESSID",)):
                 self.log.warning("no 'FANBOXSESSID' cookie set")
             FanboxExtractor._warning = False
 
-        for content_body, post in self.posts():
-            yield Message.Directory, post
+    def items(self):
+        fee_max = self.config("fee-max")
+
+        for item in self.posts():
+            if fee_max is not None and fee_max < item["feeRequired"]:
+                self.log.warning("Skipping post %s (feeRequired of %s > %s)",
+                                 item["id"], item["feeRequired"], fee_max)
+            else:
+                try:
+                    url = ("https://api.fanbox.cc/post.info?postId=" +
+                           item["id"])
+                    item = self.request_json(url, headers=self.headers)["body"]
+                except Exception as exc:
+                    self.log.warning("Skipping post %s (%s: %s)",
+                                     item["id"], exc.__class__.__name__, exc)
+
+            content_body, post = self._extract_post(item)
+            yield Message.Directory, "", post
             yield from self._get_urls_from_post(content_body, post)
 
     def posts(self):
         """Return all relevant post objects"""
 
     def _pagination(self, url):
-        headers = {"Origin": self.root}
-
         while url:
             url = text.ensure_http_scheme(url)
-            body = self.request(url, headers=headers).json()["body"]
-            for item in body["items"]:
-                yield self._process_post(item)
+            body = self.request_json(url, headers=self.headers)["body"]
+
+            yield from body["items"]
 
             url = body["nextUrl"]
 
-    def _get_post_data_from_id(self, post_id):
+    def _extract_post(self, post):
         """Fetch and process post data"""
-        headers = {"Origin": self.root}
-        url = "https://api.fanbox.cc/post.info?postId="+post_id
-        post = self.request(url, headers=headers).json()["body"]
+        post["archives"] = ()
 
-        return self._process_post(post)
-
-    def _process_post(self, post):
-        content_body = post.pop("body", None)
-        if content_body:
+        if content_body := post.pop("body", None):
             if "html" in content_body:
                 post["html"] = content_body["html"]
             if post["type"] == "article":
                 post["articleBody"] = content_body.copy()
+            if "blocks" in content_body:
+                content = []  # text content
+                images = []   # image IDs in 'body' order
+                files = []    # file IDs in 'body' order
 
-        post["date"] = text.parse_datetime(post["publishedDatetime"])
+                for block in content_body["blocks"]:
+                    if "text" in block:
+                        content.append(block["text"])
+                    if "links" in block:
+                        for link in block["links"]:
+                            content.append(link["url"])
+                    if "imageId" in block:
+                        images.append(block["imageId"])
+                    if "fileId" in block:
+                        files.append(block["fileId"])
+
+                post["content"] = "\n".join(content)
+
+                self._sort_map(content_body, "imageMap", images)
+                if file_map := self._sort_map(content_body, "fileMap", files):
+                    exts = util.EXTS_ARCHIVE
+                    post["archives"] = [
+                        file
+                        for file in file_map.values()
+                        if file.get("extension", "").lower() in exts
+                    ]
+
+        try:
+            post["date"] = self.parse_datetime_iso(post["publishedDatetime"])
+        except Exception:
+            post["date"] = None
         post["text"] = content_body.get("text") if content_body else None
         post["isCoverImage"] = False
 
+        cid = post.get("creatorId")
+        if self._meta_user and cid is not None:
+            post["user"] = self.cache(self._get_user_data, cid)
+        if self._meta_plan and cid is not None:
+            plans = self.cache(self._get_plan_data, cid)
+            fee = post.get("feeRequired") or 0
+            try:
+                post["plan"] = plans[fee]
+            except KeyError:
+                if fees := [f for f in plans if f >= fee]:
+                    plan = plans[min(fees)]
+                else:
+                    plan = plans[0].copy()
+                    plan["fee"] = fee
+                post["plan"] = plans[fee] = plan
+        if self._meta_comments:
+            if post.get("commentCount"):
+                post["comments"] = self._get_comment_data(post["id"])
+            else:
+                post["comments"] = ()
+
         return content_body, post
+
+    def _sort_map(self, body, key, ids):
+        orig = body.get(key)
+        if not orig:
+            return {} if orig is None else orig
+
+        body[key] = new = {
+            id: orig[id]
+            for id in ids
+            if id in orig
+        }
+
+        return new
+
+    def _get_user_data(self, creator_id):
+        url = "https://api.fanbox.cc/creator.get"
+        params = {"creatorId": creator_id}
+        data = self.request_json(url, params=params, headers=self.headers)
+
+        user = data["body"]
+        user.update(user.pop("user"))
+
+        return user
+
+    def _get_plan_data(self, creator_id):
+        url = "https://api.fanbox.cc/plan.listCreator"
+        params = {"creatorId": creator_id}
+        data = self.request_json(url, params=params, headers=self.headers)
+
+        plans = {0: {
+            "id"             : "",
+            "title"          : "",
+            "fee"            : 0,
+            "description"    : "",
+            "coverImageUrl"  : "",
+            "creatorId"      : creator_id,
+            "hasAdultContent": None,
+            "paymentMethod"  : None,
+        }}
+        for plan in data["body"]:
+            del plan["user"]
+            plans[plan["fee"]] = plan
+
+        return plans
+
+    def _get_comment_data(self, post_id):
+        url = ("https://api.fanbox.cc/post.getComments"
+               "?limit=10&postId=" + post_id)
+
+        comments = []
+        try:
+            while url:
+                comlist = self.request_json(
+                    text.ensure_http_scheme(url), headers=self.headers,
+                )["body"]["commentList"]
+                comments.extend(comlist["items"])
+                url = comlist["nextUrl"]
+        except Exception as exc:
+            self.log.debug("comments: %s: %s", exc.__class__.__name__, exc)
+        return comments
 
     def _get_urls_from_post(self, content_body, post):
         num = 0
-        cover_image = post.get("coverImageUrl")
-        if cover_image:
+        if cover_image := post.get("coverImageUrl"):
+            cover_image = text.re("/c/[0-9a-z_]+").sub("", cover_image)
             final_post = post.copy()
             final_post["isCoverImage"] = True
             final_post["fileUrl"] = cover_image
@@ -187,16 +326,21 @@ class FanboxExtractor(Extractor):
             # to a proper Fanbox URL
             url = "https://www.pixiv.net/fanbox/"+content_id
             # resolve redirect
-            response = self.request(url, method="HEAD", allow_redirects=False)
-            url = response.headers["Location"]
-            final_post["_extractor"] = FanboxPostExtractor
+            try:
+                url = self.request_location(url)
+            except Exception as exc:
+                url = None
+                self.log.warning("Unable to extract fanbox embed %s (%s: %s)",
+                                 content_id, exc.__class__.__name__, exc)
+            else:
+                final_post["_extractor"] = FanboxPostExtractor
         elif provider == "twitter":
             url = "https://twitter.com/_/status/"+content_id
         elif provider == "google_forms":
-            templ = "https://docs.google.com/forms/d/e/{}/viewform?usp=sf_link"
-            url = templ.format(content_id)
+            url = (f"https://docs.google.com/forms/d/e/"
+                   f"{content_id}/viewform?usp=sf_link")
         else:
-            self.log.warning("service not recognized: {}".format(provider))
+            self.log.warning("service not recognized: %s", provider)
 
         if url:
             final_post["embed"] = embed
@@ -209,74 +353,89 @@ class FanboxExtractor(Extractor):
 
 
 class FanboxCreatorExtractor(FanboxExtractor):
-    """Extractor for a Fanbox creator's works"""
+    """Extractor for a pixivFANBOX creator's works"""
     subcategory = "creator"
-    pattern = BASE_PATTERN + r"(?:/posts)?/?$"
-    test = (
-        ("https://xub.fanbox.cc", {
-            "range": "1-15",
-            "count": ">= 15",
-            "keyword": {
-                "creatorId" : "xub",
-                "tags"       : list,
-                "title"      : str,
-            },
-        }),
-        ("https://xub.fanbox.cc/posts"),
-        ("https://www.fanbox.cc/@xub/"),
-        ("https://www.fanbox.cc/@xub/posts"),
-    )
-
-    def __init__(self, match):
-        FanboxExtractor.__init__(self, match)
-        self.creator_id = match.group(1) or match.group(2)
+    pattern = USER_PATTERN + r"(?:/posts)?/?$"
+    example = "https://USER.fanbox.cc/"
 
     def posts(self):
-        url = "https://api.fanbox.cc/post.listCreator?creatorId={}&limit=10"
+        url = "https://api.fanbox.cc/post.paginateCreator?creatorId="
+        creator_id = self.groups[0] or self.groups[1]
+        return self._pagination_creator(url + creator_id)
 
-        return self._pagination(url.format(self.creator_id))
+    def _pagination_creator(self, url):
+        urls = self.request_json(url, headers=self.headers)["body"]
+        if offset := self.config("offset"):
+            quotient, remainder = divmod(offset, 10)
+            if quotient:
+                urls = urls[quotient:]
+        else:
+            remainder = None
+
+        for url in urls:
+            url = text.ensure_http_scheme(url)
+            posts = self.request_json(url, headers=self.headers)["body"]
+            if remainder:
+                posts = posts[remainder:]
+                remainder = None
+            yield from posts
+
+
+class FanboxTagExtractor(FanboxExtractor):
+    """Extractor for a pixivFANBOX creator's tagged works"""
+    subcategory = "tag"
+    pattern = USER_PATTERN + r"/tags/([^/?#]+)"
+    example = "https://USER.fanbox.cc/tags/TAG"
+
+    def posts(self):
+        cid, cid2, tag = self.groups
+        self.kwdict["search_tags"] = text.unquote(tag)
+        url = (f"https://api.fanbox.cc/post.listTagged"
+               f"?creatorId={cid or cid2}&tag={tag}")
+        return self._pagination(url)
 
 
 class FanboxPostExtractor(FanboxExtractor):
-    """Extractor for media from a single Fanbox post"""
+    """Extractor for media from a single pixivFANBOX post"""
     subcategory = "post"
-    pattern = BASE_PATTERN + r"/posts/(\d+)"
-    test = (
-        ("https://www.fanbox.cc/@xub/posts/1910054", {
-            "count": 3,
-            "keyword": {
-                "title": "えま★おうがすと",
-                "tags": list,
-                "hasAdultContent": True,
-                "isCoverImage": False
-            },
-        }),
-        # entry post type, image embedded in html of the post
-        ("https://nekoworks.fanbox.cc/posts/915", {
-            "count": 2,
-            "keyword": {
-                "title": "【SAYORI FAN CLUB】お届け内容",
-                "tags": list,
-                "html": str,
-                "hasAdultContent": True
-            },
-        }),
-        # article post type, imageMap, 2 twitter embeds, fanbox embed
-        ("https://steelwire.fanbox.cc/posts/285502", {
-            "options": (("embeds", True),),
-            "count": 10,
-            "keyword": {
-                "title": "イラスト+SS｜義足の炭鉱少年が義足を見せてくれるだけ 【全体公開版】",
-                "tags": list,
-                "articleBody": dict,
-                "hasAdultContent": True
-            },
-        }),
-    )
-
-    def __init__(self, match):
-        FanboxExtractor.__init__(self, match)
-        self.post_id = match.group(3)
+    pattern = USER_PATTERN + r"/posts/(\d+)"
+    example = "https://USER.fanbox.cc/posts/12345"
 
     def posts(self):
-        return (self._get_post_data_from_id(self.post_id),)
+        return ({"id": self.groups[2], "feeRequired": 0},)
+
+
+class FanboxHomeExtractor(FanboxExtractor):
+    """Extractor for your pixivFANBOX home feed"""
+    subcategory = "home"
+    pattern = BASE_PATTERN + r"/?$"
+    example = "https://fanbox.cc/"
+
+    def posts(self):
+        url = "https://api.fanbox.cc/post.listHome?limit=10"
+        return self._pagination(url)
+
+
+class FanboxSupportingExtractor(FanboxExtractor):
+    """Extractor for your supported pixivFANBOX users feed"""
+    subcategory = "supporting"
+    pattern = BASE_PATTERN + r"/home/supporting"
+    example = "https://fanbox.cc/home/supporting"
+
+    def posts(self):
+        url = "https://api.fanbox.cc/post.listSupporting?limit=10"
+        return self._pagination(url)
+
+
+class FanboxRedirectExtractor(Extractor):
+    """Extractor for pixiv redirects to fanbox.cc"""
+    category = "fanbox"
+    subcategory = "redirect"
+    cookies_domain = None
+    pattern = r"(?:https?://)?(?:www\.)?pixiv\.net/fanbox/creator/(\d+)"
+    example = "https://www.pixiv.net/fanbox/creator/12345"
+
+    def items(self):
+        url = "https://www.pixiv.net/fanbox/creator/" + self.groups[0]
+        location = self.request_location(url, notfound="user")
+        yield Message.Queue, location, {"_extractor": FanboxCreatorExtractor}

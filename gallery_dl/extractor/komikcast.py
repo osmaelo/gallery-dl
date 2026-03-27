@@ -1,33 +1,32 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2021 Mike Fährmann
+# Copyright 2018-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extract manga-chapters and entire manga from https://komikcast.com/"""
+"""Extractors for https://komikcast.li/"""
 
 from .common import ChapterExtractor, MangaExtractor
 from .. import text
-import re
+
+BASE_PATTERN = (r"(?:https?://)?(?:www\.)?"
+                r"komikcast\d*\.(?:l(?:i|a|ol)|com|cz|site|mo?e)")
 
 
 class KomikcastBase():
     """Base class for komikcast extractors"""
     category = "komikcast"
-    root = "https://komikcast.com"
+    root = "https://komikcast.li"
 
-    @staticmethod
-    def parse_chapter_string(chapter_string, data=None):
+    def parse_chapter_string(self, chapter_string, data=None):
         """Parse 'chapter_string' value and add its info to 'data'"""
-        if not data:
+        if data is None:
             data = {}
 
-        match = re.match(
-            r"(?:(.*) Chapter )?0*(\d+)([^ ]*)(?: (?:- )?(.+))?",
-            text.unescape(chapter_string),
-        )
+        pattern = text.re(r"(?:(.*) Chapter )?0*(\d+)([^ ]*)(?: (?:- )?(.+))?")
+        match = pattern.match(text.unescape(chapter_string))
         manga, chapter, data["chapter_minor"], title = match.groups()
 
         if manga:
@@ -44,47 +43,29 @@ class KomikcastBase():
 
 
 class KomikcastChapterExtractor(KomikcastBase, ChapterExtractor):
-    """Extractor for manga-chapters from komikcast.com"""
-    pattern = r"(?:https?://)?(?:www\.)?komikcast\.com(/chapter/[^/?#]+/)"
-    test = (
-        (("https://komikcast.com/chapter/"
-          "apotheosis-chapter-02-2-bahasa-indonesia/"), {
-            "url": "f6b43fbc027697749b3ea1c14931c83f878d7936",
-            "keyword": "f3938e1aff9ad1f302f52447e9781b21f6da26d4",
-        }),
-        (("https://komikcast.com/chapter/"
-          "solo-spell-caster-chapter-37-bahasa-indonesia/"), {
-            "url": "c3d30de6c796ff6ff36eb86e2e6fa2f8add8e829",
-            "keyword": "ed8a0ff73098776988bf66fb700381a2c748f910",
-        }),
-    )
+    """Extractor for komikcast manga chapters"""
+    pattern = BASE_PATTERN + r"(/chapter/[^/?#]+/)"
+    example = "https://komikcast.li/chapter/TITLE/"
 
     def metadata(self, page):
-        info = text.extract(page, "<title>", " – Komikcast<")[0]
+        info = text.extr(page, "<title>", " - Komikcast<")
         return self.parse_chapter_string(info)
 
-    @staticmethod
-    def images(page):
-        readerarea = text.extract(
-            page, '<div class="main-reading-area', '</div')[0]
+    def images(self, page):
+        readerarea = text.extr(
+            page, '<div class="main-reading-area', '</div')
+        pattern = text.re(r"<img[^>]* src=[\"']([^\"']+)")
         return [
             (text.unescape(url), None)
-            for url in re.findall(r"<img[^>]* src=[\"']([^\"']+)", readerarea)
+            for url in pattern.findall(readerarea)
         ]
 
 
 class KomikcastMangaExtractor(KomikcastBase, MangaExtractor):
-    """Extractor for manga from komikcast.com"""
+    """Extractor for komikcast manga"""
     chapterclass = KomikcastChapterExtractor
-    pattern = (r"(?:https?://)?(?:www\.)?komikcast\.com"
-               r"(/(?:komik/)?[^/?#]+)/?$")
-    test = (
-        ("https://komikcast.com/komik/090-eko-to-issho/", {
-            "url": "dc798d107697d1f2309b14ca24ca9dba30c6600f",
-            "keyword": "837a7e96867344ff59d840771c04c20dc46c0ab1",
-        }),
-        ("https://komikcast.com/tonari-no-kashiwagi-san/"),
-    )
+    pattern = BASE_PATTERN + r"(/(?:komik/)?[^/?#]+/?)$"
+    example = "https://komikcast.li/komik/TITLE"
 
     def chapters(self, page):
         results = []
@@ -92,15 +73,16 @@ class KomikcastMangaExtractor(KomikcastBase, MangaExtractor):
 
         for item in text.extract_iter(
                 page, '<a class="chapter-link-item" href="', '</a'):
-            url, _, chapter_string = item.rpartition('">Chapter ')
-            self.parse_chapter_string(chapter_string, data)
+            url, _, chapter = item.rpartition('">Chapter')
+            chapter, sep, minor = chapter.strip().partition(".")
+            data["chapter"] = text.parse_int(chapter)
+            data["chapter_minor"] = sep + minor
             results.append((url, data.copy()))
         return results
 
-    @staticmethod
-    def metadata(page):
+    def metadata(self, page):
         """Return a dict with general metadata"""
-        manga , pos = text.extract(page, "<title>" , " – Komikcast<")
+        manga , pos = text.extract(page, "<title>" , " - Komikcast<")
         genres, pos = text.extract(
             page, 'class="komik_info-content-genre">', "</span>", pos)
         author, pos = text.extract(page, ">Author:", "</span>", pos)

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2015-2021 Mike Fährmann
+# Copyright 2015-2023 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -25,30 +25,42 @@ class BooruExtractor(BaseExtractor):
         data = self.metadata()
         tags = self.config("tags", False)
         notes = self.config("notes", False)
+        fetch_html = tags or notes
+
+        if url_key := self.config("url"):
+            if isinstance(url_key, (list, tuple)):
+                self._file_url = self._file_url_list
+                self._file_url_keys = url_key
+            else:
+                self._file_url = operator.itemgetter(url_key)
 
         for post in self.posts():
             try:
                 url = self._file_url(post)
                 if url[0] == "/":
                     url = self.root + url
-            except (KeyError, TypeError):
-                self.log.debug("Unable to fetch download URL for post %s "
-                               "(md5: %s)", post.get("id"), post.get("md5"))
+            except Exception as exc:
+                self.log.debug("%s: %s", exc.__class__.__name__, exc)
+                self.log.warning("Unable to fetch download URL for post %s "
+                                 "(md5: %s)", post.get("id"), post.get("md5"))
                 continue
 
-            page_html = None
-            if tags:
-                page_html = self._extended_tags(post)
-            if notes:
-                self._notes(post, page_html)
-            self._prepare(post)
-            post.update(data)
-            text.nameext_from_url(url, post)
+            if fetch_html:
+                html = self._html(post)
+                if tags:
+                    self._tags(post, html)
+                if notes:
+                    self._notes(post, html)
 
-            yield Message.Directory, post
+            if "extension" not in post:
+                text.nameext_from_url(url, post)
+            post.update(data)
+            self._prepare(post)
+
+            yield Message.Directory, "", post
             yield Message.Url, url, post
 
-    def skip(self, num):
+    def skip_files(self, num):
         pages = num // self.per_page
         self.page_start += pages
         return pages * self.per_page
@@ -66,17 +78,19 @@ class BooruExtractor(BaseExtractor):
 
     _file_url = operator.itemgetter("file_url")
 
+    def _file_url_list(self, post):
+        urls = (post[key] for key in self._file_url_keys if post.get(key))
+        post["_fallback"] = it = iter(urls)
+        return next(it)
+
     def _prepare(self, post):
-        """Prepare the 'post's metadata"""
+        """Prepare a 'post's metadata"""
 
-    def _extended_tags(self, post, page=None):
-        """Generate extended tag information
+    def _html(self, post):
+        """Return HTML content of a post"""
 
-        The return value of this function will be
-        passed to the _notes function as the page parameter.
-        This makes it possible to reuse the same HTML both for
-        extracting tags and notes.
-        """
+    def _tags(self, post, page):
+        """Extract extended tag metadata"""
 
-    def _notes(self, post, page=None):
-        """Generate information about notes"""
+    def _notes(self, post, page):
+        """Extract notes metadata"""

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2021 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -29,7 +29,7 @@ class _35photoExtractor(Extractor):
                 url = photo["url"]
                 if first:
                     first = False
-                    yield Message.Directory, photo
+                    yield Message.Directory, "", photo
                 yield Message.Url, url, text.nameext_from_url(url, photo)
 
     def metadata(self):
@@ -49,14 +49,14 @@ class _35photoExtractor(Extractor):
         if extra_ids:
             yield from extra_ids
         while params["lastId"]:
-            data = self.request(url, headers=headers, params=params).json()
+            data = self.request_json(url, headers=headers, params=params)
             yield from self._photo_ids(data["data"])
             params["lastId"] = data["lastId"]
 
     def _photo_data(self, photo_id):
         params = {"method": "photo.getData", "photoId": photo_id}
-        data = self.request(
-            "https://api.35photo.pro/", params=params).json()["data"][photo_id]
+        data = self.request_json(
+            "https://api.35photo.pro/", params=params)["data"][photo_id]
         info = {
             "url"        : data["src"],
             "id"         : data["photo_id"],
@@ -83,8 +83,7 @@ class _35photoExtractor(Extractor):
             info["num"] = 1
             yield info
 
-    @staticmethod
-    def _photo_ids(page):
+    def _photo_ids(self, page):
         """Extract unique photo IDs and return them as sorted list"""
         #  searching for photo-id="..." doesn't always work (see unit tests)
         if not page:
@@ -101,30 +100,17 @@ class _35photoUserExtractor(_35photoExtractor):
     subcategory = "user"
     pattern = (r"(?:https?://)?(?:[a-z]+\.)?35photo\.pro"
                r"/(?!photo_|genre_|tags/|rating/)([^/?#]+)")
-    test = (
-        ("https://35photo.pro/liya", {
-            "pattern": r"https://([a-z][0-9]\.)?35photo\.pro"
-                       r"/photos_(main|series)/.*\.jpg",
-            "count": 9,
-        }),
-        ("https://35photo.pro/suhoveev", {
-            # last photo ID (1267028) isn't given as 'photo-id="<id>"
-            # there are only 23 photos without the last one
-            "count": ">= 33",
-        }),
-        ("https://en.35photo.pro/liya"),
-        ("https://ru.35photo.pro/liya"),
-    )
+    example = "https://35photo.pro/USER"
 
     def __init__(self, match):
         _35photoExtractor.__init__(self, match)
-        self.user = match.group(1)
+        self.user = match[1]
         self.user_id = 0
 
     def metadata(self):
-        url = "{}/{}/".format(self.root, self.user)
+        url = f"{self.root}/{self.user}/"
         page = self.request(url).text
-        self.user_id = text.parse_int(text.extract(page, "/user_", ".xml")[0])
+        self.user_id = text.parse_int(text.extr(page, "/user_", ".xml"))
         return {
             "user": self.user,
             "user_id": self.user_id,
@@ -143,14 +129,11 @@ class _35photoTagExtractor(_35photoExtractor):
     directory_fmt = ("{category}", "Tags", "{search_tag}")
     archive_fmt = "t{search_tag}_{id}_{num}"
     pattern = r"(?:https?://)?(?:[a-z]+\.)?35photo\.pro/tags/([^/?#]+)"
-    test = ("https://35photo.pro/tags/landscape/", {
-        "range": "1-25",
-        "count": 25,
-    })
+    example = "https://35photo.pro/tags/TAG/"
 
     def __init__(self, match):
         _35photoExtractor.__init__(self, match)
-        self.tag = match.group(1)
+        self.tag = match[1]
 
     def metadata(self):
         return {"search_tag": text.unquote(self.tag).lower()}
@@ -159,7 +142,7 @@ class _35photoTagExtractor(_35photoExtractor):
         num = 1
 
         while True:
-            url = "{}/tags/{}/list_{}/".format(self.root, self.tag, num)
+            url = f"{self.root}/tags/{self.tag}/list_{num}/"
             page = self.request(url).text
             prev = None
 
@@ -179,7 +162,7 @@ class _35photoGenreExtractor(_35photoExtractor):
     directory_fmt = ("{category}", "Genre", "{genre}")
     archive_fmt = "g{genre_id}_{id}_{num}"
     pattern = r"(?:https?://)?(?:[a-z]+\.)?35photo\.pro/genre_(\d+)(/new/)?"
-    test = ("https://35photo.pro/genre_109/",)
+    example = "https://35photo.pro/genre_12345/"
 
     def __init__(self, match):
         _35photoExtractor.__init__(self, match)
@@ -187,12 +170,12 @@ class _35photoGenreExtractor(_35photoExtractor):
         self.photo_ids = None
 
     def metadata(self):
-        url = "{}/genre_{}{}".format(self.root, self.genre_id, self.new or "/")
+        url = f"{self.root}/genre_{self.genre_id}{self.new or '/'}"
         page = self.request(url).text
-        self.photo_ids = self._photo_ids(text.extract(
-            page, ' class="photo', '\n')[0])
+        self.photo_ids = self._photo_ids(text.extr(
+            page, ' class="photo', '\n'))
         return {
-            "genre": text.extract(page, " genre - ", ". ")[0],
+            "genre": text.extr(page, " genre - ", ". "),
             "genre_id": text.parse_int(self.genre_id),
         }
 
@@ -211,28 +194,11 @@ class _35photoImageExtractor(_35photoExtractor):
     """Extractor for individual images from 35photo.pro"""
     subcategory = "image"
     pattern = r"(?:https?://)?(?:[a-z]+\.)?35photo\.pro/photo_(\d+)"
-    test = ("https://35photo.pro/photo_753340/", {
-        "count": 1,
-        "keyword": {
-            "url"        : r"re:https://35photo\.pro/photos_main/.*\.jpg",
-            "id"         : 753340,
-            "title"      : "Winter walk",
-            "description": str,
-            "tags"       : list,
-            "views"      : int,
-            "favorites"  : int,
-            "score"      : int,
-            "type"       : 0,
-            "date"       : "15 авг, 2014",
-            "user"       : "liya",
-            "user_id"    : 20415,
-            "user_name"  : "Liya Mirzaeva",
-        },
-    })
+    example = "https://35photo.pro/photo_12345/"
 
     def __init__(self, match):
         _35photoExtractor.__init__(self, match)
-        self.photo_id = match.group(1)
+        self.photo_id = match[1]
 
     def photos(self):
         return (self.photo_id,)

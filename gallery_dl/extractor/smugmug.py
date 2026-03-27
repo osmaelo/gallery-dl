@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2021 Mike Fährmann
+# Copyright 2018-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extract images from https://www.smugmug.com/"""
+"""Extractors for https://www.smugmug.com/"""
 
 from .common import Extractor, Message
-from .. import text, oauth, exception
+from .. import text, oauth
 
 BASE_PATTERN = (
     r"(?:smugmug:(?!album:)(?:https?://)?([^/]+)|"
-    r"(?:https?://)?([^.]+)\.smugmug\.com)")
+    r"(?:https?://)?([\w-]+)\.smugmug\.com)")
 
 
 class SmugmugExtractor(Extractor):
@@ -21,7 +21,6 @@ class SmugmugExtractor(Extractor):
     category = "smugmug"
     filename_fmt = ("{category}_{User[NickName]:?/_/}"
                     "{Image[UploadKey]}_{Image[ImageKey]}.{extension}")
-    cookiedomain = None
     empty_user = {
         "Uri": "",
         "ResponseLevel": "Public",
@@ -34,8 +33,7 @@ class SmugmugExtractor(Extractor):
         "Uris": None,
     }
 
-    def __init__(self, match):
-        Extractor.__init__(self, match)
+    def _init(self):
         self.api = SmugmugAPI(self)
         self.videos = self.config("videos", True)
         self.session = self.api.session
@@ -69,23 +67,11 @@ class SmugmugAlbumExtractor(SmugmugExtractor):
     directory_fmt = ("{category}", "{User[NickName]}", "{Album[Name]}")
     archive_fmt = "a_{Album[AlbumKey]}_{Image[ImageKey]}"
     pattern = r"smugmug:album:([^:]+)$"
-    test = (
-        ("smugmug:album:cr4C7f", {
-            "url": "2c2e576e47d4e9ce60b44871f08a8c66b5ebaceb",
-        }),
-        # empty
-        ("smugmug:album:Fb7hMs", {
-            "count": 0,
-        }),
-        # no "User"
-        ("smugmug:album:6VRT8G", {
-            "url": "c4a0f4c4bfd514b93cbdeb02b3345bf7ef6604df",
-        }),
-    )
+    example = "smugmug:album:ID"
 
     def __init__(self, match):
         SmugmugExtractor.__init__(self, match)
-        self.album_id = match.group(1)
+        self.album_id = match[1]
 
     def items(self):
         album = self.api.album(self.album_id, "User")
@@ -95,7 +81,7 @@ class SmugmugAlbumExtractor(SmugmugExtractor):
         del album["Uris"]
         data = {"Album": album, "User": user}
 
-        yield Message.Directory, data
+        yield Message.Directory, "", data
 
         for image in self.api.album_images(self.album_id, "ImageSizeDetails"):
             url = self._select_format(image)
@@ -108,22 +94,11 @@ class SmugmugImageExtractor(SmugmugExtractor):
     subcategory = "image"
     archive_fmt = "{Image[ImageKey]}"
     pattern = BASE_PATTERN + r"(?:/[^/?#]+)+/i-([^/?#-]+)"
-    test = (
-        ("https://tdm.smugmug.com/Nature/Dove/i-kCsLJT6", {
-            "url": "e6408fd2c64e721fd146130dceb56a971ceb4259",
-            "keyword": "b15af021186b7234cebcac758d2a4fd8462f9912",
-            "content": "ecbd9d7b4f75a637abc8d35319be9ec065a44eb0",
-        }),
-        # video
-        ("https://tstravels.smugmug.com/Dailies/Daily-Dose-2015/i-39JFNzB", {
-            "url": "04d0ab1ff829ca7d78f5acb5548953df08e9a5ee",
-            "keyword": "f6967cc5a46c3e130a4f8de7c5c971f72e07fe61",
-        }),
-    )
+    example = "https://USER.smugmug.com/PATH/i-ID"
 
     def __init__(self, match):
         SmugmugExtractor.__init__(self, match)
-        self.image_id = match.group(3)
+        self.image_id = match[3]
 
     def items(self):
         image = self.api.image(self.image_id, "ImageSizeDetails")
@@ -132,7 +107,7 @@ class SmugmugImageExtractor(SmugmugExtractor):
         data = {"Image": image}
         text.nameext_from_url(url, data)
 
-        yield Message.Directory, data
+        yield Message.Directory, "", data
         yield Message.Url, url, data
 
 
@@ -140,35 +115,13 @@ class SmugmugPathExtractor(SmugmugExtractor):
     """Extractor for smugmug albums from URL paths and users"""
     subcategory = "path"
     pattern = BASE_PATTERN + r"((?:/[^/?#a-fh-mo-z][^/?#]*)*)/?$"
-    test = (
-        ("https://tdm.smugmug.com/Nature/Dove", {
-            "pattern": "smugmug:album:cr4C7f$",
-        }),
-        ("https://tdm.smugmug.com/", {
-            "pattern": SmugmugAlbumExtractor.pattern,
-            "url": "1640028712875b90974e5aecd91b60e6de6138c7",
-        }),
-        # gallery node without owner
-        ("https://www.smugmug.com/gallery/n-GLCjnD/", {
-            "pattern": "smugmug:album:6VRT8G$",
-        }),
-        # custom domain
-        ("smugmug:www.sitkapics.com/TREES-and-TRAILS/", {
-            "pattern": "smugmug:album:ct8Nds$",
-        }),
-        ("smugmug:www.sitkapics.com/", {
-            "pattern": r"smugmug:album:\w{6}$",
-            "count": ">= 14",
-        }),
-        ("smugmug:https://www.sitkapics.com/"),
-    )
+    example = "https://USER.smugmug.com/PATH"
 
     def __init__(self, match):
         SmugmugExtractor.__init__(self, match)
         self.domain, self.user, self.path = match.groups()
 
     def items(self):
-
         if not self.user:
             self.user = self.api.site_user(self.domain)["NickName"]
 
@@ -209,9 +162,9 @@ class SmugmugPathExtractor(SmugmugExtractor):
 class SmugmugAPI(oauth.OAuth1API):
     """Minimal interface for the smugmug API v2"""
     API_DOMAIN = "api.smugmug.com"
-    API_KEY = "DFqxg4jf7GrtsQ5PnbNB8899zKfnDrdK"
-    API_SECRET = ("fknV35p9r9BwZC4XbTzvCXpcSJRdD83S"
-                  "9nMFQm25ndGBzNPnwRDbRnnVBvqt4xTq")
+    API_KEY = "RCVHDGjcbc4Fhzq4qzqLdZmvwmwB6LM2"
+    API_SECRET = ("jGrdndvJqhTx8XSNs7TFTSSthhZHq92d"
+                  "dMpbpDpkDVNM7TDgnvLFMtfB5Mg5kH73")
     HEADERS = {"Accept": "application/json"}
 
     def album(self, album_id, expands=None):
@@ -244,29 +197,32 @@ class SmugmugAPI(oauth.OAuth1API):
         return self._expansion(endpoint, "Node", params)
 
     def _call(self, endpoint, params=None, domain=API_DOMAIN):
-        url = "https://{}/api/v2/{}".format(domain, endpoint)
+        url = f"https://{domain}/api/v2/{endpoint}"
         params = params or {}
         if self.api_key:
             params["APIKey"] = self.api_key
         params["_verbosity"] = "1"
 
         response = self.request(url, params=params, headers=self.HEADERS)
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            raise self.exc.NotFoundError(self.extractor.__class__.subcategory)
 
         if 200 <= data["Code"] < 400:
             return data
         if data["Code"] == 404:
-            raise exception.NotFoundError()
+            raise self.exc.NotFoundError(self.extractor.__class__.subcategory)
         if data["Code"] == 429:
-            raise exception.StopExtraction("Rate limit reached")
+            raise self.exc.AbortExtraction("Rate limit reached")
         self.log.debug(data)
-        raise exception.StopExtraction("API request failed")
+        raise self.exc.AbortExtraction("API request failed")
 
     def _expansion(self, endpoint, expands, params=None):
         endpoint = self._extend(endpoint, expands)
         result = self._apply_expansions(self._call(endpoint, params), expands)
         if not result:
-            raise exception.NotFoundError()
+            raise self.exc.NotFoundError()
         return result[0]
 
     def _pagination(self, endpoint, expands=None):
@@ -281,14 +237,12 @@ class SmugmugAPI(oauth.OAuth1API):
                 return
             params["start"] += params["count"]
 
-    @staticmethod
-    def _extend(endpoint, expands):
+    def _extend(self, endpoint, expands):
         if expands:
             endpoint += "?_expand=" + expands
         return endpoint
 
-    @staticmethod
-    def _apply_expansions(data, expands):
+    def _apply_expansions(self, data, expands):
 
         def unwrap(response):
             locator = response["Locator"]

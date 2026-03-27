@@ -1,22 +1,30 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2021 Mike Fährmann
+# Copyright 2018-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extract images from https://www.behance.net/"""
+"""Extractors for https://www.behance.net/"""
 
 from .common import Extractor, Message
-from .. import text
-import json
+from .. import text, util
 
 
 class BehanceExtractor(Extractor):
     """Base class for behance extractors"""
     category = "behance"
     root = "https://www.behance.net"
+    request_interval = (2.0, 4.0)
+    browser = "firefox"
+    tls12 = False
+
+    def _init(self):
+        self._bcp = self.cookies.get("bcp", domain="www.behance.net")
+        if not self._bcp:
+            self._bcp = "4c34489d-914c-46cd-b44c-dfd0e661136d"
+            self.cookies.set("bcp", self._bcp, domain="www.behance.net")
 
     def items(self):
         for gallery in self.galleries():
@@ -26,14 +34,29 @@ class BehanceExtractor(Extractor):
     def galleries(self):
         """Return all relevant gallery URLs"""
 
-    @staticmethod
-    def _update(data):
+    def _request_graphql(self, endpoint, variables):
+        url = self.root + "/v3/graphql"
+        headers = {
+            "Origin": self.root,
+            "X-BCP" : self._bcp,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        data = {
+            "query"    : self.utils("graphql", endpoint),
+            "variables": variables,
+        }
+
+        return self.request_json(
+            url, method="POST", headers=headers, json=data)["data"]
+
+    def _update(self, data):
         # compress data to simple lists
-        if data["fields"] and isinstance(data["fields"][0], dict):
+        if (fields := data.get("fields")) and isinstance(fields[0], dict):
             data["fields"] = [
                 field.get("name") or field.get("label")
-                for field in data["fields"]
+                for field in fields
             ]
+
         data["owners"] = [
             owner.get("display_name") or owner.get("displayName")
             for owner in data["owners"]
@@ -43,6 +66,12 @@ class BehanceExtractor(Extractor):
         if tags and isinstance(tags[0], dict):
             tags = [tag["title"] for tag in tags]
         data["tags"] = tags
+
+        data["date"] = self.parse_timestamp(
+            data.get("publishedOn") or data.get("conceived_on") or 0)
+
+        if creator := data.get("creator"):
+            creator["name"] = creator["url"].rpartition("/")[2]
 
         # backwards compatibility
         data["gallery_id"] = data["id"]
@@ -59,101 +88,140 @@ class BehanceGalleryExtractor(BehanceExtractor):
     filename_fmt = "{category}_{id}_{num:>02}.{extension}"
     archive_fmt = "{id}_{num}"
     pattern = r"(?:https?://)?(?:www\.)?behance\.net/gallery/(\d+)"
-    test = (
-        ("https://www.behance.net/gallery/17386197/A-Short-Story", {
-            "count": 2,
-            "url": "ab79bd3bef8d3ae48e6ac74fd995c1dfaec1b7d2",
-            "keyword": {
-                "id": 17386197,
-                "name": 're:"Hi". A short story about the important things ',
-                "owners": ["Place Studio", "Julio César Velazquez"],
-                "fields": ["Animation", "Character Design", "Directing"],
-                "tags": list,
-                "module": dict,
-            },
-        }),
-        ("https://www.behance.net/gallery/21324767/Nevada-City", {
-            "count": 6,
-            "url": "0258fe194fe7d828d6f2c7f6086a9a0a4140db1d",
-            "keyword": {"owners": ["Alex Strohl"]},
-        }),
-        # 'media_collection' modules
-        ("https://www.behance.net/gallery/88276087/Audi-R8-RWD", {
-            "count": 20,
-            "url": "6bebff0d37f85349f9ad28bd8b76fd66627c1e2f",
-        }),
-        # 'video' modules (#1282)
-        ("https://www.behance.net/gallery/101185577/COLCCI", {
-            "pattern": r"ytdl:https://adobeprod-a\.akamaihd\.net/",
-            "count": 3,
-        }),
-    )
+    example = "https://www.behance.net/gallery/12345/TITLE"
 
     def __init__(self, match):
         BehanceExtractor.__init__(self, match)
-        self.gallery_id = match.group(1)
+        self.gallery_id = match[1]
+
+    def _init(self):
+        BehanceExtractor._init(self)
+
+        if modules := self.config("modules"):
+            if isinstance(modules, str):
+                modules = modules.split(",")
+            self.modules = set(modules)
+        else:
+            self.modules = {"image", "video", "mediacollection", "embed"}
 
     def items(self):
         data = self.get_gallery_data()
         imgs = self.get_images(data)
         data["count"] = len(imgs)
 
-        yield Message.Directory, data
+        yield Message.Directory, "", data
         for data["num"], (url, module) in enumerate(imgs, 1):
             data["module"] = module
-            data["extension"] = text.ext_from_url(url)
+            data["extension"] = (module.get("extension") or
+                                 text.ext_from_url(url))
             yield Message.Url, url, data
 
     def get_gallery_data(self):
         """Collect gallery info dict"""
-        url = "{}/gallery/{}/a".format(self.root, self.gallery_id)
+        url = f"{self.root}/gallery/{self.gallery_id}/a"
         cookies = {
-            "_evidon_consent_cookie":
-                '{"consent_date":"2019-01-31T09:41:15.132Z"}',
-            "bcp": "4c34489d-914c-46cd-b44c-dfd0e661136d",
-            "gk_suid": "66981391",
-            "gki": '{"feature_project_view":false,'
-                   '"feature_discover_login_prompt":false,'
-                   '"feature_project_login_prompt":false}',
+            "gk_suid": "14118261",
+            "gki": "feature_3_in_1_checkout_test:false,hire_browse_get_quote_c"
+                   "ta_ab_test:false,feature_hire_dashboard_services_ab_test:f"
+                   "alse,feature_show_details_jobs_row_ab_test:false,feature_a"
+                   "i_freelance_project_create_flow:false,",
             "ilo0": "true",
+            "originalReferrer": "",
         }
         page = self.request(url, cookies=cookies).text
 
-        data = json.loads(text.extract(
-            page, 'id="beconfig-store_state">', '</script>')[0])
+        data = util.json_loads(text.extr(
+            page, 'id="beconfig-store_state">', '</script>'))
         return self._update(data["project"]["project"])
 
     def get_images(self, data):
         """Extract image results from an API response"""
-        result = []
-        append = result.append
+        if not data["modules"]:
+            access = data.get("matureAccess")
+            if access == "logged-out":
+                raise self.exc.AuthorizationError(
+                    "Mature content galleries require logged-in cookies")
+            if access == "restricted-safe":
+                raise self.exc.AuthorizationError(
+                    "Mature content blocked in account settings")
+            if access and access != "allowed":
+                raise self.exc.AuthorizationError()
+            return ()
 
+        results = []
         for module in data["modules"]:
-            mtype = module["type"]
+            mtype = module["__typename"][:-6].lower()
+
+            if mtype not in self.modules:
+                self.log.debug("Skipping '%s' module", mtype)
+                continue
 
             if mtype == "image":
-                url = module["sizes"]["original"]
-                append((url, module))
+                sizes = {
+                    size["url"].rsplit("/", 2)[1]: size
+                    for size in module["imageSizes"]["allAvailable"]
+                }
+                size = (sizes.get("source") or
+                        sizes.get("max_3840") or
+                        sizes.get("fs") or
+                        sizes.get("hd") or
+                        sizes.get("disp"))
+                results.append((size["url"], module))
 
             elif mtype == "video":
-                page = self.request(module["src"]).text
-                url = text.extract(page, '<source src="', '"')[0]
-                if text.ext_from_url(url) == "m3u8":
-                    url = "ytdl:" + url
-                append((url, module))
+                try:
+                    url = text.extr(module["embed"], 'src="', '"')
+                    page = self.request(text.unescape(url)).text
 
-            elif mtype == "media_collection":
+                    url = text.extr(page, '<source src="', '"')
+                    if text.ext_from_url(url) == "m3u8":
+                        url = "ytdl:" + url
+                        module["_ytdl_manifest"] = "hls"
+                        module["extension"] = "mp4"
+                    results.append((url, module))
+                    continue
+                except Exception as exc:
+                    self.log.debug("%s: %s", exc.__class__.__name__, exc)
+
+                try:
+                    renditions = module["videoData"]["renditions"]
+                except Exception:
+                    self.log.warning("No download URLs for video %s",
+                                     module.get("id") or "???")
+                    continue
+
+                try:
+                    url = [
+                        r["url"] for r in renditions
+                        if text.ext_from_url(r["url"]) != "m3u8"
+                    ][-1]
+                except Exception as exc:
+                    self.log.debug("%s: %s", exc.__class__.__name__, exc)
+                    url = "ytdl:" + renditions[-1]["url"]
+
+                results.append((url, module))
+
+            elif mtype == "mediacollection":
                 for component in module["components"]:
-                    url = component["sizes"]["source"]
-                    append((url, module))
+                    for size in component["imageSizes"].values():
+                        if size:
+                            parts = size["url"].split("/")
+                            parts[4] = "source"
+                            results.append(("/".join(parts), module))
+                            break
 
             elif mtype == "embed":
-                embed = module.get("original_embed") or module.get("embed")
-                if embed:
-                    url = "ytdl:" + text.extract(embed, 'src="', '"')[0]
-                    append((url, module))
+                if embed := (module.get("originalEmbed") or
+                             module.get("fluidEmbed")):
+                    embed = text.unescape(text.extr(embed, 'src="', '"'))
+                    module["extension"] = "mp4"
+                    results.append(("ytdl:" + embed, module))
 
-        return result
+            elif mtype == "text":
+                module["extension"] = "txt"
+                results.append(("text:" + module["text"], module))
+
+        return results
 
 
 class BehanceUserExtractor(BehanceExtractor):
@@ -161,27 +229,27 @@ class BehanceUserExtractor(BehanceExtractor):
     subcategory = "user"
     categorytransfer = True
     pattern = r"(?:https?://)?(?:www\.)?behance\.net/([^/?#]+)/?$"
-    test = ("https://www.behance.net/alexstrohl", {
-        "count": ">= 8",
-        "pattern": BehanceGalleryExtractor.pattern,
-    })
+    example = "https://www.behance.net/USER"
 
     def __init__(self, match):
         BehanceExtractor.__init__(self, match)
-        self.user = match.group(1)
+        self.user = match[1]
 
     def galleries(self):
-        url = "{}/{}/projects".format(self.root, self.user)
-        params = {"offset": 0}
-        headers = {"X-Requested-With": "XMLHttpRequest"}
+        endpoint = "GetProfileProjects"
+        variables = {
+            "username": self.user,
+            "after"   : "MAo=",  # "0" in base64
+        }
 
         while True:
-            data = self.request(url, params=params, headers=headers).json()
-            work = data["profile"]["activeSection"]["work"]
-            yield from work["projects"]
-            if not work["hasMore"]:
+            data = self._request_graphql(endpoint, variables)
+            items = data["user"]["profileProjects"]
+            yield from items["nodes"]
+
+            if not items["pageInfo"]["hasNextPage"]:
                 return
-            params["offset"] += len(work["projects"])
+            variables["after"] = items["pageInfo"]["endCursor"]
 
 
 class BehanceCollectionExtractor(BehanceExtractor):
@@ -189,290 +257,26 @@ class BehanceCollectionExtractor(BehanceExtractor):
     subcategory = "collection"
     categorytransfer = True
     pattern = r"(?:https?://)?(?:www\.)?behance\.net/collection/(\d+)"
-    test = ("https://www.behance.net/collection/71340149/inspiration", {
-        "count": ">= 145",
-        "pattern": BehanceGalleryExtractor.pattern,
-    })
+    example = "https://www.behance.net/collection/12345/TITLE"
 
     def __init__(self, match):
         BehanceExtractor.__init__(self, match)
-        self.collection_id = match.group(1)
+        self.collection_id = match[1]
 
     def galleries(self):
-        url = self.root + "/v3/graphql"
-        headers = {
-            "Origin" : self.root,
-            "Referer": self.root + "/collection/" + self.collection_id,
-            "X-BCP"           : "4c34489d-914c-46cd-b44c-dfd0e661136d",
-            "X-NewRelic-ID"   : "VgUFVldbGwsFU1BRDwUBVw==",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        cookies = {
-            "bcp"    : "4c34489d-914c-46cd-b44c-dfd0e661136d",
-            "gk_suid": "66981391",
-            "ilo0"   : "true",
-        }
-
-        query = """
-query GetMoodboardItemsAndRecommendations(
-  $id: Int!
-  $firstItem: Int!
-  $afterItem: String
-  $shouldGetRecommendations: Boolean!
-  $shouldGetItems: Boolean!
-  $shouldGetMoodboardFields: Boolean!
-) {
-  viewer @include(if: $shouldGetMoodboardFields) {
-    isOptedOutOfRecommendations
-    isAdmin
-  }
-  moodboard(id: $id) {
-    ...moodboardFields @include(if: $shouldGetMoodboardFields)
-
-    items(first: $firstItem, after: $afterItem) @include(if: $shouldGetItems) {
-      pageInfo {
-        endCursor
-        hasNextPage
-      }
-      nodes {
-        ...nodesFields
-      }
-    }
-
-    recommendedItems(first: 80) @include(if: $shouldGetRecommendations) {
-      nodes {
-        ...nodesFields
-        fetchSource
-      }
-    }
-  }
-}
-
-fragment moodboardFields on Moodboard {
-  id
-  label
-  privacy
-  followerCount
-  isFollowing
-  projectCount
-  url
-  isOwner
-  owners {
-    id
-    displayName
-    url
-    firstName
-    location
-    locationUrl
-    isFollowing
-    images {
-      size_50 {
-        url
-      }
-      size_100 {
-        url
-      }
-      size_115 {
-        url
-      }
-      size_230 {
-        url
-      }
-      size_138 {
-        url
-      }
-      size_276 {
-        url
-      }
-    }
-  }
-}
-
-fragment projectFields on Project {
-  id
-  isOwner
-  publishedOn
-  matureAccess
-  hasMatureContent
-  modifiedOn
-  name
-  url
-  isPrivate
-  slug
-  license {
-    license
-    description
-    id
-    label
-    url
-    text
-    images
-  }
-  fields {
-    label
-  }
-  colors {
-    r
-    g
-    b
-  }
-  owners {
-    url
-    displayName
-    id
-    location
-    locationUrl
-    isProfileOwner
-    isFollowing
-    images {
-      size_50 {
-        url
-      }
-      size_100 {
-        url
-      }
-      size_115 {
-        url
-      }
-      size_230 {
-        url
-      }
-      size_138 {
-        url
-      }
-      size_276 {
-        url
-      }
-    }
-  }
-  covers {
-    size_original {
-      url
-    }
-    size_max_808 {
-      url
-    }
-    size_808 {
-      url
-    }
-    size_404 {
-      url
-    }
-    size_202 {
-      url
-    }
-    size_230 {
-      url
-    }
-    size_115 {
-      url
-    }
-  }
-  stats {
-    views {
-      all
-    }
-    appreciations {
-      all
-    }
-    comments {
-      all
-    }
-  }
-}
-
-fragment exifDataValueFields on exifDataValue {
-  id
-  label
-  value
-  searchValue
-}
-
-fragment nodesFields on MoodboardItem {
-  id
-  entityType
-  width
-  height
-  flexWidth
-  flexHeight
-  images {
-    size
-    url
-  }
-
-  entity {
-    ... on Project {
-      ...projectFields
-    }
-
-    ... on ImageModule {
-      project {
-        ...projectFields
-      }
-
-      colors {
-        r
-        g
-        b
-      }
-
-      exifData {
-        lens {
-          ...exifDataValueFields
-        }
-        software {
-          ...exifDataValueFields
-        }
-        makeAndModel {
-          ...exifDataValueFields
-        }
-        focalLength {
-          ...exifDataValueFields
-        }
-        iso {
-          ...exifDataValueFields
-        }
-        location {
-          ...exifDataValueFields
-        }
-        flash {
-          ...exifDataValueFields
-        }
-        exposureMode {
-          ...exifDataValueFields
-        }
-        shutterSpeed {
-          ...exifDataValueFields
-        }
-        aperture {
-          ...exifDataValueFields
-        }
-      }
-    }
-
-    ... on MediaCollectionComponent {
-      project {
-        ...projectFields
-      }
-    }
-  }
-}
-"""
+        endpoint = "GetMoodboardItemsAndRecommendations"
         variables = {
-            "afterItem": "MAo=",
+            "afterItem": "MAo=",  # "0" in base64
             "firstItem": 40,
             "id"       : int(self.collection_id),
             "shouldGetItems"          : True,
             "shouldGetMoodboardFields": False,
             "shouldGetRecommendations": False,
         }
-        data = {"query": query, "variables": variables}
 
         while True:
-            items = self.request(
-                url, method="POST", headers=headers,
-                cookies=cookies, json=data,
-            ).json()["data"]["moodboard"]["items"]
+            data = self._request_graphql(endpoint, variables)
+            items = data["moodboard"]["items"]
 
             for node in items["nodes"]:
                 yield node["entity"]

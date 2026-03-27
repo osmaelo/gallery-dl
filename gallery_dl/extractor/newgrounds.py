@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2021 Mike Fährmann
+# Copyright 2018-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -8,11 +8,12 @@
 
 """Extractors for https://www.newgrounds.com/"""
 
-from .common import Extractor, Message
-from .. import text, exception
-from ..cache import cache
+from .common import Extractor, Message, Dispatch
+from .. import text, util, dt
 import itertools
-import json
+
+BASE_PATTERN = r"(?:https?://)?(?:www\.)?newgrounds\.com"
+USER_PATTERN = r"(?:https?://)?([\w-]+)\.newgrounds\.com"
 
 
 class NewgroundsExtractor(Extractor):
@@ -20,84 +21,129 @@ class NewgroundsExtractor(Extractor):
     category = "newgrounds"
     directory_fmt = ("{category}", "{artist[:10]:J, }")
     filename_fmt = "{category}_{_index}_{title}.{extension}"
-    archive_fmt = "{_index}"
+    archive_fmt = "{_type}{_index}"
     root = "https://www.newgrounds.com"
-    cookiedomain = ".newgrounds.com"
-    cookienames = ("NG_GG_username", "vmk1du5I8m")
+    cookies_domain = ".newgrounds.com"
+    cookies_names = ("ng_session",)
+    request_interval = (0.5, 1.5)
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.user = match.group(1)
-        self.user_root = "https://{}.newgrounds.com".format(self.user)
+        self.user = match[1]
+        self.user_root = f"https://{self.user}.newgrounds.com"
+
+    def _init(self):
+        self._extract_comment_urls = text.re(
+            r'(?:<img |data-smartload-)src="([^"]+)').findall
         self.flash = self.config("flash", True)
 
-        fmt = self.config("format", "original")
-        self.format = (True if not fmt or fmt == "original" else
-                       fmt if isinstance(fmt, int) else
-                       text.parse_int(fmt.rstrip("p")))
+        fmt = self.config("format")
+        if not fmt or fmt == "original":
+            self.format = ("mp4", "webm", "m4v", "mov", "mkv",
+                           1080, 720, 360)
+        elif isinstance(fmt, (list, tuple)):
+            self.format = fmt
+        else:
+            self._video_formats = self._video_formats_limit
+            self.format = (fmt if isinstance(fmt, int) else
+                           text.parse_int(fmt.rstrip("p")))
 
     def items(self):
         self.login()
+        metadata = self.metadata()
 
         for post_url in self.posts():
             try:
                 post = self.extract_post(post_url)
                 url = post.get("url")
-            except Exception:
-                self.log.debug("", exc_info=True)
+            except Exception as exc:
+                self.log.traceback(exc)
                 url = None
 
             if url:
-                yield Message.Directory, post
+                if metadata:
+                    post.update(metadata)
+                yield Message.Directory, "", post
+                post["num"] = 0
                 yield Message.Url, url, text.nameext_from_url(url, post)
 
-                for num, url in enumerate(text.extract_iter(
-                        post["_comment"], 'data-smartload-src="', '"'), 1):
-                    post["num"] = num
-                    post["_index"] = "{}_{:>02}".format(post["index"], num)
+                if "_multi" in post:
+                    for data in post["_multi"]:
+                        post["num"] += 1
+                        post["_index"] = f"{post['index']}_{post['num']:>02}"
+                        post.update(data)
+                        url = data["image"]
+
+                        text.nameext_from_url(url, post)
+                        yield Message.Url, url, post
+
+                        if "_fallback" in post:
+                            del post["_fallback"]
+
+                for url in self._extract_comment_urls(post["_comment"]):
+                    post["num"] += 1
+                    post["_index"] = f"{post['index']}_{post['num']:>02}"
                     url = text.ensure_http_scheme(url)
-                    yield Message.Url, url, text.nameext_from_url(url, post)
+                    text.nameext_from_url(url, post)
+                    yield Message.Url, url, post
             else:
+                self.status |= 1
                 self.log.warning(
                     "Unable to get download URL for '%s'", post_url)
 
     def posts(self):
-        """Return urls of all relevant image pages"""
-        return self._pagination(self._path)
+        """Return URLs of all relevant post pages"""
+        return self._pagination(self.__class__.subcategory, self.groups[1])
+
+    def metadata(self):
+        """Return general metadata"""
 
     def login(self):
+        if self.cookies_check(self.cookies_names):
+            return
+
         username, password = self._get_auth_info()
         if username:
-            self._update_cookies(self._login_impl(username, password))
+            return self.cookies_update(self.cache(
+                self._login_impl, username, password,
+                _exp=365*86400, _mem=False))
 
-    @cache(maxage=360*24*3600, keyarg=1)
     def _login_impl(self, username, password):
         self.log.info("Logging in as %s", username)
 
-        url = self.root + "/passport/"
-        page = self.request(url).text
-        headers = {"Origin": self.root, "Referer": url}
+        url = self.root + "/login"
+        response = self.request(url)
+        if response.history and response.url.endswith("/social"):
+            return self.cookies
 
-        url = text.urljoin(self.root, text.extract(page, 'action="', '"')[0])
+        page = response.text
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": self.root,
+            "Referer": url,
+        }
         data = {
-            "username": username,
-            "password": password,
+            "_token"  : text.extr(page, 'name="_token" value="', '"'),
             "remember": "1",
-            "login"   : "1",
+            "identity": username,
+            "password": str(password),
         }
 
-        response = self.request(url, method="POST", headers=headers, data=data)
-        if not response.history:
-            raise exception.AuthenticationError()
+        try:
+            response = self.request(
+                url, method="POST", headers=headers, data=data)
+        except Exception:
+            raise self.exc.AuthenticationError()
 
         return {
             cookie.name: cookie.value
-            for cookie in response.history[0].cookies
-            if cookie.expires and cookie.domain == self.cookiedomain
+            for cookie in response.cookies
         }
 
     def extract_post(self, post_url):
-
+        url = post_url
         if "/art/view/" in post_url:
             extract_data = self._extract_image_data
         elif "/audio/listen/" in post_url:
@@ -105,56 +151,105 @@ class NewgroundsExtractor(Extractor):
         else:
             extract_data = self._extract_media_data
             if self.flash:
-                post_url += "/format/flash"
+                url += "/format/flash"
 
-        response = self.request(post_url, fatal=False)
+        response = self.request(url, fatal=False)
+        page = response.text
+
+        pos = page.find('id="adults_only"')
+        if pos >= 0:
+            msg = text.extract(page, 'class="highlight">', '<', pos)[0]
+            self.log.warning('"%s"', msg)
+            return {}
+
         if response.status_code >= 400:
             return {}
-        page = response.text
+
         extr = text.extract_from(page)
         data = extract_data(extr, post_url)
 
-        data["_comment"] = extr('id="author_comments"', '</div>')
+        data["comment_html"] = data["_comment"] = extr(
+            'id="author_comments"', '</div>').partition(">")[2].strip()
         data["comment"] = text.unescape(text.remove_html(
-            data["_comment"].partition(">")[2], "", ""))
+            data["_comment"]
+            .replace("<p><br></p>", "\n\n").replace("<br>", "\n"), "", ""))
         data["favorites"] = text.parse_int(extr(
             'id="faves_load">', '<').replace(",", ""))
         data["score"] = text.parse_float(extr('id="score_number">', '<'))
-        data["tags"] = text.split_html(extr('<dd class="tags">', '</dd>'))
+        data["tags"] = [
+            t for t in text.split_html(extr('<dd class="tags">', '</dd>'))
+            if "(function(" not in t
+        ]
         data["artist"] = [
-            text.extract(user, '//', '.')[0]
+            text.extr(user, '//', '.')
             for user in text.extract_iter(page, '<div class="item-user">', '>')
         ]
 
         data["tags"].sort()
         data["user"] = self.user or data["artist"][0]
+        data["slug"] = post_url[post_url.rfind("/")+1:]
+        data["post_url"] = post_url
         return data
 
-    @staticmethod
-    def _extract_image_data(extr, url):
-        full = text.extract_from(json.loads(extr('"full_image_text":', '});')))
+    def _extract_image_data(self, extr, url):
+        full = text.extract_from(util.json_loads(extr(
+            '"full_image_text":', '});')))
         data = {
             "title"      : text.unescape(extr('"og:title" content="', '"')),
             "description": text.unescape(extr(':description" content="', '"')),
-            "date"       : text.parse_datetime(extr(
+            "type"       : "art",
+            "_type"      : "i",
+            "date"       : dt.parse_iso(extr(
                 'itemprop="datePublished" content="', '"')),
             "rating"     : extr('class="rated-', '"'),
             "url"        : full('src="', '"'),
             "width"      : text.parse_int(full('width="', '"')),
             "height"     : text.parse_int(full('height="', '"')),
         }
+
+        if not data["url"]:
+            data["url"] = extr('<a href="', '"')
+
         index = data["url"].rpartition("/")[2].partition("_")[0]
         data["index"] = text.parse_int(index)
         data["_index"] = index
+
+        if image_data := extr("let imageData =", "\n];"):
+            data["_multi"] = self._extract_images_multi(image_data)
+        else:
+            if art_images := extr('<div class="art-images', '\n\t\t</div>'):
+                data["_multi"] = self._extract_images_art(art_images, data)
+
         return data
 
-    @staticmethod
-    def _extract_audio_data(extr, url):
+    def _extract_images_multi(self, html):
+        data = util.json_loads(html + "]")
+        yield from data[1:]
+
+    def _extract_images_art(self, html, data):
+        ext = text.ext_from_url(data["url"])
+        for url in text.extract_iter(html, 'data-smartload-src="', '"'):
+            url = text.ensure_http_scheme(url)
+            url = url.replace("/medium_views/", "/images/", 1)
+            if text.ext_from_url(url) == "webp":
+                fallback = [url.replace(".webp", "." + e)
+                            for e in ("jpg", "png", "gif") if e != ext]
+                fallback.append(url)
+                yield {
+                    "image"    : url.replace(".webp", "." + ext),
+                    "_fallback": fallback,
+                }
+            else:
+                yield {"image": url}
+
+    def _extract_audio_data(self, extr, url):
         index = url.split("/")[5]
         return {
             "title"      : text.unescape(extr('"og:title" content="', '"')),
             "description": text.unescape(extr(':description" content="', '"')),
-            "date"       : text.parse_datetime(extr(
+            "type"       : "audio",
+            "_type"      : "a",
+            "date"       : dt.parse_iso(extr(
                 'itemprop="datePublished" content="', '"')),
             "url"        : extr('{"url":"', '"').replace("\\/", "/"),
             "index"      : text.parse_int(index),
@@ -165,72 +260,88 @@ class NewgroundsExtractor(Extractor):
     def _extract_media_data(self, extr, url):
         index = url.split("/")[5]
         title = extr('"og:title" content="', '"')
+        type = extr('og:type" content="', '"')
+        descr = extr('"og:description" content="', '"')
         src = extr('{"url":"', '"')
 
         if src:
             src = src.replace("\\/", "/")
-            fallback = ()
-            date = text.parse_datetime(extr(
+            formats = ()
+            type = extr(',"description":"', '"')
+            date = dt.parse_iso(extr(
                 'itemprop="datePublished" content="', '"'))
+            if type:
+                type = type.rpartition(" ")[2].lower()
+            else:
+                type = "flash" if text.ext_from_url(url) == "swf" else "game"
         else:
             url = self.root + "/portal/video/" + index
             headers = {
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": self.root,
             }
-            sources = self.request(url, headers=headers).json()["sources"]
-
-            if self.format is True:
-                src = sources["360p"][0]["src"].replace(".360p.", ".")
-                formats = sources
-            else:
-                formats = []
-                for fmt, src in sources.items():
-                    width = text.parse_int(fmt.rstrip("p"))
-                    if width <= self.format:
-                        formats.append((width, src))
-                if formats:
-                    formats.sort(reverse=True)
-                    src, formats = formats[0][1][0]["src"], formats[1:]
-                else:
-                    src = ""
-
-            fallback = self._video_fallback(formats)
-            date = text.parse_timestamp(src.rpartition("?")[2])
+            sources = self.request_json(url, headers=headers)["sources"]
+            formats = self._video_formats(sources)
+            src = next(formats, "")
+            date = self.parse_timestamp(src.rpartition("?")[2])
+            type = "movie"
 
         return {
             "title"      : text.unescape(title),
             "url"        : src,
             "date"       : date,
-            "description": text.unescape(extr(
+            "type"       : type,
+            "_type"      : "",
+            "description": text.unescape(descr or extr(
                 'itemprop="description" content="', '"')),
             "rating"     : extr('class="rated-', '"'),
             "index"      : text.parse_int(index),
             "_index"     : index,
-            "_fallback"  : fallback,
+            "_fallback"  : formats,
         }
 
-    @staticmethod
-    def _video_fallback(formats):
-        if isinstance(formats, dict):
-            formats = list(formats.items())
-            formats.sort(key=lambda fmt: text.parse_int(fmt[0].rstrip("p")),
-                         reverse=True)
+    def _video_formats(self, sources):
+        src = sources["360p"][0]["src"]
+        sub = text.re(r"\.360p\.\w+").sub
+
+        for fmt in self.format:
+            try:
+                if isinstance(fmt, int):
+                    yield sources[str(fmt) + "p"][0]["src"]
+                elif fmt in sources:
+                    yield sources[fmt][0]["src"]
+                else:
+                    yield sub("." + fmt, src, 1)
+            except Exception as exc:
+                self.log.debug("Video format '%s' not available (%s: %s)",
+                               fmt, exc.__class__.__name__, exc)
+
+    def _video_formats_limit(self, sources):
+        formats = []
+        for fmt, src in sources.items():
+            width = text.parse_int(fmt.rstrip("p"))
+            if width <= self.format:
+                formats.append((width, src))
+
+        formats.sort(reverse=True)
         for fmt in formats:
             yield fmt[1][0]["src"]
 
-    def _pagination(self, kind):
-        root = self.user_root
-        headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": root,
+    def _pagination(self, kind, pnum=1):
+        url = f"{self.user_root}/{kind}"
+        params = {
+            "page": text.parse_int(pnum, 1),
+            "isAjaxRequest": "1",
         }
-        url = "{}/{}/page/1".format(root, kind)
+        headers = {
+            "Referer": url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
 
         while True:
-            with self.request(url, headers=headers, fatal=False) as response:
+            with self.request(
+                    url, params=params, headers=headers,
+                    fatal=False) as response:
                 try:
                     data = response.json()
                 except ValueError:
@@ -239,16 +350,23 @@ class NewgroundsExtractor(Extractor):
                     return
                 if "errors" in data:
                     msg = ", ".join(text.unescape(e) for e in data["errors"])
-                    raise exception.StopExtraction(msg)
+                    raise self.exc.AbortExtraction(msg)
 
-            for year in data["sequence"]:
-                for item in data["years"][str(year)]["items"]:
-                    page_url = text.extract(item, 'href="', '"')[0]
-                    yield text.urljoin(root, page_url)
-
-            if not data["more"]:
+            items = data.get("items")
+            if not items:
                 return
-            url = text.urljoin(root, data["more"])
+
+            for year, items in items.items():
+                for item in items:
+                    page_url = text.extr(item, 'href="', '"')
+                    if page_url[0] == "/":
+                        page_url = self.root + page_url
+                    yield page_url
+
+            more = data.get("load_more")
+            if not more or len(more) < 8:
+                return
+            params["page"] += 1
 
 
 class NewgroundsImageExtractor(NewgroundsExtractor):
@@ -257,44 +375,15 @@ class NewgroundsImageExtractor(NewgroundsExtractor):
     pattern = (r"(?:https?://)?(?:"
                r"(?:www\.)?newgrounds\.com/art/view/([^/?#]+)/[^/?#]+"
                r"|art\.ngfiles\.com/images/\d+/\d+_([^_]+)_([^.]+))")
-    test = (
-        ("https://www.newgrounds.com/art/view/tomfulp/ryu-is-hawt", {
-            "url": "57f182bcbbf2612690c3a54f16ffa1da5105245e",
-            "content": "8f395e08333eb2457ba8d8b715238f8910221365",
-            "keyword": {
-                "artist"     : ["tomfulp"],
-                "comment"    : "re:Consider this the bottom threshold for ",
-                "date"       : "dt:2009-06-04 14:44:05",
-                "description": "re:Consider this the bottom threshold for ",
-                "favorites"  : int,
-                "filename"   : "94_tomfulp_ryu-is-hawt",
-                "height"     : 476,
-                "index"      : 94,
-                "rating"     : "e",
-                "score"      : float,
-                "tags"       : ["ryu", "streetfighter"],
-                "title"      : "Ryu is Hawt",
-                "user"       : "tomfulp",
-                "width"      : 447,
-            },
-        }),
-        ("https://art.ngfiles.com/images/0/94_tomfulp_ryu-is-hawt.gif", {
-            "url": "57f182bcbbf2612690c3a54f16ffa1da5105245e",
-        }),
-        ("https://www.newgrounds.com/art/view/sailoryon/yon-dream-buster", {
-            "url": "84eec95e663041a80630df72719f231e157e5f5d",
-            "count": 2,
-        })
-    )
+    example = "https://www.newgrounds.com/art/view/USER/TITLE"
 
     def __init__(self, match):
         NewgroundsExtractor.__init__(self, match)
-        if match.group(2):
-            self.user = match.group(2)
-            self.post_url = "https://www.newgrounds.com/art/view/{}/{}".format(
-                self.user, match.group(3))
+        if match[2]:
+            self.user = match[2]
+            self.post_url = f"{self.root}/art/view/{self.user}/{match[3]}"
         else:
-            self.post_url = text.ensure_http_scheme(match.group(0))
+            self.post_url = text.ensure_http_scheme(match[0])
 
     def posts(self):
         return (self.post_url,)
@@ -303,59 +392,13 @@ class NewgroundsImageExtractor(NewgroundsExtractor):
 class NewgroundsMediaExtractor(NewgroundsExtractor):
     """Extractor for a media file from newgrounds.com"""
     subcategory = "media"
-    pattern = (r"(?:https?://)?(?:www\.)?newgrounds\.com"
-               r"(/(?:portal/view|audio/listen)/\d+)")
-    test = (
-        ("https://www.newgrounds.com/portal/view/595355", {
-            "pattern": r"https://uploads\.ungrounded\.net/alternate/564000"
-                       r"/564957_alternate_31\.mp4\?1359712249",
-            "keyword": {
-                "artist"     : ["kickinthehead", "danpaladin", "tomfulp"],
-                "comment"    : "re:My fan trailer for Alien Hominid HD!",
-                "date"       : "dt:2013-02-01 09:50:49",
-                "favorites"  : int,
-                "filename"   : "564957_alternate_31",
-                "index"      : 595355,
-                "rating"     : "e",
-                "score"      : float,
-                "tags"       : ["alienhominid", "trailer"],
-                "title"      : "Alien Hominid Fan Trailer",
-                "user"       : "kickinthehead",
-            },
-        }),
-        ("https://www.newgrounds.com/audio/listen/609768", {
-            "url": "f4c5490ae559a3b05e46821bb7ee834f93a43c95",
-            "keyword": {
-                "artist"     : ["zj", "tomfulp"],
-                "comment"    : "re:RECORDED 12-09-2014\n\nFrom The ZJ \"Late ",
-                "date"       : "dt:2015-02-23 19:31:59",
-                "description": "From The ZJ Report Show!",
-                "favorites"  : int,
-                "index"      : 609768,
-                "rating"     : "",
-                "score"      : float,
-                "tags"       : ["fulp", "interview", "tom", "zj"],
-                "title"      : "ZJ Interviews Tom Fulp!",
-                "user"       : "zj",
-            },
-        }),
-        # flash animation (#1257)
-        ("https://www.newgrounds.com/portal/view/161181/format/flash", {
-            "pattern": r"https://uploads\.ungrounded\.net/161000"
-                       r"/161181_ddautta_mask__550x281_\.swf\?f1081628129",
-        }),
-        # format selection (#1729)
-        ("https://www.newgrounds.com/portal/view/758545", {
-            "options": (("format", "720p"),),
-            "pattern": r"https://uploads\.ungrounded\.net/alternate/1482000"
-                       r"/1482860_alternate_102516\.720p\.mp4\?\d+",
-        }),
-    )
+    pattern = BASE_PATTERN + r"(/(?:portal/view|audio/listen)/\d+)"
+    example = "https://www.newgrounds.com/portal/view/12345"
 
     def __init__(self, match):
         NewgroundsExtractor.__init__(self, match)
         self.user = ""
-        self.post_url = self.root + match.group(1)
+        self.post_url = self.root + match[1]
 
     def posts(self):
         return (self.post_url,)
@@ -363,55 +406,43 @@ class NewgroundsMediaExtractor(NewgroundsExtractor):
 
 class NewgroundsArtExtractor(NewgroundsExtractor):
     """Extractor for all images of a newgrounds user"""
-    subcategory = _path = "art"
-    pattern = r"(?:https?://)?([\w-]+)\.newgrounds\.com/art/?$"
-    test = ("https://tomfulp.newgrounds.com/art", {
-        "pattern": NewgroundsImageExtractor.pattern,
-        "count": ">= 3",
-    })
+    subcategory = "art"
+    pattern = USER_PATTERN + r"/art(?:(?:/page/|/?\?page=)(\d+))?/?$"
+    example = "https://USER.newgrounds.com/art"
 
 
 class NewgroundsAudioExtractor(NewgroundsExtractor):
     """Extractor for all audio submissions of a newgrounds user"""
-    subcategory = _path = "audio"
-    pattern = r"(?:https?://)?([\w-]+)\.newgrounds\.com/audio/?$"
-    test = ("https://tomfulp.newgrounds.com/audio", {
-        "pattern": r"https://audio.ngfiles.com/\d+/\d+_.+\.mp3",
-        "count": ">= 4",
-    })
+    subcategory = "audio"
+    pattern = USER_PATTERN + r"/audio(?:(?:/page/|/?\?page=)(\d+))?/?$"
+    example = "https://USER.newgrounds.com/audio"
 
 
 class NewgroundsMoviesExtractor(NewgroundsExtractor):
     """Extractor for all movies of a newgrounds user"""
-    subcategory = _path = "movies"
-    pattern = r"(?:https?://)?([\w-]+)\.newgrounds\.com/movies/?$"
-    test = ("https://tomfulp.newgrounds.com/movies", {
-        "pattern": r"https://uploads.ungrounded.net(/alternate)?/\d+/\d+_.+",
-        "range": "1-10",
-        "count": 10,
-    })
+    subcategory = "movies"
+    pattern = USER_PATTERN + r"/movies(?:(?:/page/|/?\?page=)(\d+))?/?$"
+    example = "https://USER.newgrounds.com/movies"
 
 
-class NewgroundsUserExtractor(NewgroundsExtractor):
+class NewgroundsGamesExtractor(NewgroundsExtractor):
+    """Extractor for a newgrounds user's games"""
+    subcategory = "games"
+    pattern = USER_PATTERN + r"/games(?:(?:/page/|/?\?page=)(\d+))?/?$"
+    example = "https://USER.newgrounds.com/games"
+
+
+class NewgroundsUserExtractor(Dispatch, NewgroundsExtractor):
     """Extractor for a newgrounds user profile"""
-    subcategory = "user"
-    pattern = r"(?:https?://)?([\w-]+)\.newgrounds\.com/?$"
-    test = (
-        ("https://tomfulp.newgrounds.com", {
-            "pattern": "https://tomfulp.newgrounds.com/art$",
-        }),
-        ("https://tomfulp.newgrounds.com", {
-            "options": (("include", "all"),),
-            "pattern": "https://tomfulp.newgrounds.com/(art|audio|movies)$",
-            "count": 3,
-        }),
-    )
+    pattern = USER_PATTERN + r"/?$"
+    example = "https://USER.newgrounds.com"
 
     def items(self):
         base = self.user_root + "/"
         return self._dispatch_extractors((
             (NewgroundsArtExtractor   , base + "art"),
             (NewgroundsAudioExtractor , base + "audio"),
+            (NewgroundsGamesExtractor , base + "games"),
             (NewgroundsMoviesExtractor, base + "movies"),
         ), ("art",))
 
@@ -420,76 +451,110 @@ class NewgroundsFavoriteExtractor(NewgroundsExtractor):
     """Extractor for posts favorited by a newgrounds user"""
     subcategory = "favorite"
     directory_fmt = ("{category}", "{user}", "Favorites")
-    pattern = (r"(?:https?://)?([^.]+)\.newgrounds\.com"
-               r"/favorites(?!/following)(?:/(art|audio|movies))?/?")
-    test = (
-        ("https://tomfulp.newgrounds.com/favorites/art", {
-            "range": "1-10",
-            "count": ">= 10",
-        }),
-        ("https://tomfulp.newgrounds.com/favorites/audio"),
-        ("https://tomfulp.newgrounds.com/favorites/movies"),
-        ("https://tomfulp.newgrounds.com/favorites/"),
-    )
-
-    def __init__(self, match):
-        NewgroundsExtractor.__init__(self, match)
-        self.kind = match.group(2)
+    pattern = (USER_PATTERN + r"/favorites(?!/following)(?:/(art|audio|movies)"
+               r"(?:(?:/page/|/?\?page=)(\d+))?)?")
+    example = "https://USER.newgrounds.com/favorites"
 
     def posts(self):
-        if self.kind:
-            return self._pagination(self.kind)
+        _, kind, pnum = self.groups
+        if kind:
+            return self._pagination_favorites(kind, pnum)
         return itertools.chain.from_iterable(
-            self._pagination(k) for k in ("art", "audio", "movies")
+            self._pagination_favorites(k) for k in ("art", "audio", "movies")
         )
 
-    def _pagination(self, kind):
-        num = 1
+    def _pagination_favorites(self, kind, pnum=1):
+        url = f"{self.user_root}/favorites/{kind}"
+        params = {
+            "page": text.parse_int(pnum, 1),
+            "isAjaxRequest": "1",
+        }
         headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": url,
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": self.user_root,
         }
 
         while True:
-            url = "{}/favorites/{}/{}".format(self.user_root, kind, num)
-            response = self.request(url, headers=headers)
+            response = self.request(url, params=params, headers=headers)
             if response.history:
                 return
 
-            favs = self._extract_favorites(response.text)
+            data = response.json()
+            favs = self._extract_favorites(data.get("component") or "")
             yield from favs
 
             if len(favs) < 24:
                 return
-            num += 1
+            params["page"] += 1
 
     def _extract_favorites(self, page):
         return [
             self.root + path
-            for path in text.extract_iter(
-                page, 'href="https://www.newgrounds.com', '"')
+            for path in text.extract_iter(page, 'href="' + self.root, '"')
         ]
 
 
 class NewgroundsFollowingExtractor(NewgroundsFavoriteExtractor):
     """Extractor for a newgrounds user's favorited users"""
     subcategory = "following"
-    pattern = r"(?:https?://)?([^.]+)\.newgrounds\.com/favorites/(following)"
-    test = ("https://tomfulp.newgrounds.com/favorites/following", {
-        "pattern": NewgroundsUserExtractor.pattern,
-        "range": "76-125",
-        "count": 50,
-    })
+    pattern = (USER_PATTERN + r"/favorites/(following)"
+               r"(?:(?:/page/|/?\?page=)(\d+))?")
+    example = "https://USER.newgrounds.com/favorites/following"
 
     def items(self):
+        _, kind, pnum = self.groups
         data = {"_extractor": NewgroundsUserExtractor}
-        for url in self._pagination(self.kind):
+        for url in self._pagination_favorites(kind, pnum):
             yield Message.Queue, url, data
 
-    @staticmethod
-    def _extract_favorites(page):
+    def _extract_favorites(self, page):
         return [
             text.ensure_http_scheme(user.rpartition('"')[2])
             for user in text.extract_iter(page, 'class="item-user', '"><img')
         ]
+
+
+class NewgroundsSearchExtractor(NewgroundsExtractor):
+    """Extractor for newgrounds.com search reesults"""
+    subcategory = "search"
+    directory_fmt = ("{category}", "search", "{search_tags}")
+    pattern = BASE_PATTERN + r"/search/conduct/([^/?#]+)/?\?([^#]+)"
+    example = "https://www.newgrounds.com/search/conduct/art?terms=QUERY"
+
+    def __init__(self, match):
+        NewgroundsExtractor.__init__(self, match)
+        self._path, query = self.groups
+        self.query = text.parse_query(query)
+
+    def posts(self):
+        if suitabilities := self.query.get("suitabilities"):
+            data = {"view_suitability_" + s: "on"
+                    for s in suitabilities.split(",")}
+            self.request(self.root + "/suitabilities",
+                         method="POST", data=data)
+        return self._pagination_search(
+            "/search/conduct/" + self._path, self.query)
+
+    def metadata(self):
+        return {"search_tags": self.query.get("terms", "")}
+
+    def _pagination_search(self, path, params):
+        url = self.root + path
+        params["inner"] = "1"
+        params["page"] = text.parse_int(params.get("page"), 1)
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        while True:
+            data = self.request_json(url, params=params, headers=headers)
+
+            post_url = None
+            for post_url in text.extract_iter(data["content"], 'href="', '"'):
+                if not post_url.startswith("/search/"):
+                    yield post_url
+
+            if post_url is None:
+                return
+            params["page"] += 1

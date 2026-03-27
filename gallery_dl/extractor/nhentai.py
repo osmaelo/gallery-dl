@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2015-2021 Mike Fährmann
+# Copyright 2015-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -11,7 +11,7 @@
 from .common import GalleryExtractor, Extractor, Message
 from .. import text, util
 import collections
-import json
+import random
 
 
 class NhentaiGalleryExtractor(GalleryExtractor):
@@ -19,36 +19,14 @@ class NhentaiGalleryExtractor(GalleryExtractor):
     category = "nhentai"
     root = "https://nhentai.net"
     pattern = r"(?:https?://)?nhentai\.net/g/(\d+)"
-    test = ("https://nhentai.net/g/147850/", {
-        "url": "5179dbf0f96af44005a0ff705a0ad64ac26547d0",
-        "keyword": {
-            "title"     : r"re:\[Morris\] Amazon no Hiyaku \| Amazon Elixir",
-            "title_en"  : str,
-            "title_ja"  : str,
-            "gallery_id": 147850,
-            "media_id"  : 867789,
-            "count"     : 16,
-            "date"      : 1446050915,
-            "scanlator" : "",
-            "artist"    : ["morris"],
-            "group"     : list,
-            "parody"    : list,
-            "characters": list,
-            "tags"      : list,
-            "type"      : "manga",
-            "lang"      : "en",
-            "language"  : "English",
-            "width"     : int,
-            "height"    : int,
-        },
-    })
+    example = "https://nhentai.net/g/12345/"
 
     def __init__(self, match):
-        url = self.root + "/api/gallery/" + match.group(1)
+        url = self.root + "/api/gallery/" + match[1]
         GalleryExtractor.__init__(self, match, url)
 
     def metadata(self, page):
-        self.data = data = json.loads(page)
+        self.data = data = util.json_loads(page)
 
         title_en = data["title"].get("english", "")
         title_ja = data["title"].get("japanese", "")
@@ -82,15 +60,18 @@ class NhentaiGalleryExtractor(GalleryExtractor):
         }
 
     def images(self, _):
-        ufmt = ("https://i.nhentai.net/galleries/" +
-                self.data["media_id"] + "/{}.{}")
-        extdict = {"j": "jpg", "p": "png", "g": "gif"}
+        exts = {"j": "jpg", "p": "png", "g": "gif", "w": "webp", "a": "avif"}
+
+        data = self.data
+        ufmt = ("https://i{}.nhentai.net/galleries/" +
+                data["media_id"] + "/{}.{}").format
 
         return [
-            (ufmt.format(num, extdict.get(img["t"], "jpg")), {
-                "width": img["w"], "height": img["h"],
+            (ufmt(random.randint(1, 4), num, exts.get(img["t"], "jpg")), {
+                "width" : img["w"],
+                "height": img["h"],
             })
-            for num, img in enumerate(self.data["images"]["pages"], 1)
+            for num, img in enumerate(data["images"]["pages"], 1)
         ]
 
 
@@ -106,7 +87,8 @@ class NhentaiExtractor(Extractor):
     def items(self):
         data = {"_extractor": NhentaiGalleryExtractor}
         for gallery_id in self._pagination():
-            url = "{}/g/{}/".format(self.root, gallery_id)
+            url = f"{self.root}/g/{gallery_id}/"
+            data["gallery_id"] = text.parse_int(gallery_id)
             yield Message.Queue, url, data
 
     def _pagination(self):
@@ -128,34 +110,18 @@ class NhentaiTagExtractor(NhentaiExtractor):
     pattern = (r"(?:https?://)?nhentai\.net("
                r"/(?:artist|category|character|group|language|parody|tag)"
                r"/[^/?#]+(?:/popular[^/?#]*)?/?)(?:\?([^#]+))?")
-    test = (
-        ("https://nhentai.net/tag/sole-female/", {
-            "pattern": NhentaiGalleryExtractor.pattern,
-            "count": 30,
-            "range": "1-30",
-        }),
-        ("https://nhentai.net/artist/itou-life/"),
-        ("https://nhentai.net/group/itou-life/"),
-        ("https://nhentai.net/parody/touhou-project/"),
-        ("https://nhentai.net/character/patchouli-knowledge/popular"),
-        ("https://nhentai.net/category/doujinshi/popular-today"),
-        ("https://nhentai.net/language/english/popular-week"),
-    )
+    example = "https://nhentai.net/tag/TAG/"
 
 
 class NhentaiSearchExtractor(NhentaiExtractor):
     """Extractor for nhentai search results"""
     subcategory = "search"
     pattern = r"(?:https?://)?nhentai\.net(/search/?)\?([^#]+)"
-    test = ("https://nhentai.net/search/?q=touhou", {
-        "pattern": NhentaiGalleryExtractor.pattern,
-        "count": 30,
-        "range": "1-30",
-    })
+    example = "https://nhentai.net/search/?q=QUERY"
 
 
 class NhentaiFavoriteExtractor(NhentaiExtractor):
     """Extractor for nhentai favorites"""
     subcategory = "favorite"
     pattern = r"(?:https?://)?nhentai\.net(/favorites/?)(?:\?([^#]+))?"
-    test = ("https://nhentai.net/favorites/",)
+    example = "https://nhentai.net/favorites/"

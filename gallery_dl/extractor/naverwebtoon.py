@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # Copyright 2021 Seonghyeon Cho
+# Copyright 2022-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -11,33 +12,27 @@
 from .common import GalleryExtractor, Extractor, Message
 from .. import text
 
-BASE_PATTERN = r"(?:https?://)?comic\.naver\.com/webtoon"
+BASE_PATTERN = (r"(?:https?://)?comic\.naver\.com"
+                r"/(webtoon|challenge|bestChallenge)")
 
 
-class NaverwebtoonBase():
-    """Base class for naver webtoon extractors"""
-    category = "naverwebtoon"
+class NaverWebtoonBase():
+    """Base class for comic.naver.com extractors"""
+    category = "naver-webtoon"
     root = "https://comic.naver.com"
 
 
-class NaverwebtoonEpisodeExtractor(NaverwebtoonBase, GalleryExtractor):
+class NaverWebtoonEpisodeExtractor(NaverWebtoonBase, GalleryExtractor):
     subcategory = "episode"
     directory_fmt = ("{category}", "{comic}")
     filename_fmt = "{episode:>03}-{num:>02}.{extension}"
     archive_fmt = "{title_id}_{episode}_{num}"
-    pattern = BASE_PATTERN + r"/detail\.nhn\?([^#]+)"
-    test = (
-        (("https://comic.naver.com/webtoon/detail.nhn?"
-          "titleId=26458&no=1&weekday=tue"), {
-            "url": "47a956ba8c7a837213d5985f50c569fcff986f75",
-            "content": "3806b6e8befbb1920048de9888dfce6220f69a60",
-            "count": 14
-        }),
-    )
+    pattern = BASE_PATTERN + r"/detail(?:\.nhn)?\?([^#]+)"
+    example = "https://comic.naver.com/webtoon/detail?titleId=12345&no=1"
 
     def __init__(self, match):
-        query = match.group(1)
-        url = "{}/webtoon/detail.nhn?{}".format(self.root, query)
+        path, query = match.groups()
+        url = f"{self.root}/{path}/detail?{query}"
         GalleryExtractor.__init__(self, match, url)
 
         query = text.parse_query(query)
@@ -49,17 +44,18 @@ class NaverwebtoonEpisodeExtractor(NaverwebtoonBase, GalleryExtractor):
         return {
             "title_id": self.title_id,
             "episode" : self.episode,
-            "title"   : extr('property="og:title" content="', '"'),
-            "comic"   : extr('<h2>', '<span'),
-            "authors" : extr('class="wrt_nm">', '</span>').strip().split("/"),
-            "description": extr('<p class="txt">', '</p>'),
-            "genre"   : extr('<span class="genre">', '</span>'),
-            "date"    : extr('<dd class="date">', '</dd>'),
+            "comic"   : extr('titleName: "', '"'),
+            "tags"    : [t.strip() for t in text.extract_iter(
+                extr("tagList: [", "],"), '"tagName":"', '"')],
+            "title"   : extr('"subtitle":"', '"'),
+            "author"  : [a.strip() for a in text.extract_iter(
+                extr('"writers":[', ']'), '"name":"', '"')],
+            "artist"  : [a.strip() for a in text.extract_iter(
+                extr('"painters":[', ']'), '"name":"', '"')]
         }
 
-    @staticmethod
-    def images(page):
-        view_area = text.extract(page, 'id="comic_view_area"', '</div>')[0]
+    def images(self, page):
+        view_area = text.extr(page, 'id="comic_view_area"', '</div>')
         return [
             (url, None)
             for url in text.extract_iter(view_area, '<img src="', '"')
@@ -67,43 +63,41 @@ class NaverwebtoonEpisodeExtractor(NaverwebtoonBase, GalleryExtractor):
         ]
 
 
-class NaverwebtoonComicExtractor(NaverwebtoonBase, Extractor):
+class NaverWebtoonComicExtractor(NaverWebtoonBase, Extractor):
     subcategory = "comic"
     categorytransfer = True
-    pattern = (BASE_PATTERN + r"/list\.nhn\?([^#]+)")
-    test = (
-        ("https://comic.naver.com/webtoon/list.nhn?titleId=22073", {
-            "pattern": NaverwebtoonEpisodeExtractor.pattern,
-            "count": 32,
-        }),
-    )
+    pattern = BASE_PATTERN + r"/list(?:\.nhn)?\?([^#]+)"
+    example = "https://comic.naver.com/webtoon/list?titleId=12345"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        query = text.parse_query(match.group(1))
+        self.path, query = match.groups()
+        query = text.parse_query(query)
         self.title_id = query.get("titleId")
         self.page_no = text.parse_int(query.get("page"), 1)
+        self.sort = query.get("sort", "ASC")
 
     def items(self):
-        url = self.root + "/webtoon/list.nhn"
-        params = {"titleId": self.title_id, "page": self.page_no}
-        data = {"_extractor": NaverwebtoonEpisodeExtractor}
+        url = self.root + "/api/article/list"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+        }
+        params = {
+            "titleId": self.title_id,
+            "page"   : self.page_no,
+            "sort"   : self.sort,
+        }
 
         while True:
-            page = self.request(url, params=params).text
-            data["page"] = self.page_no
+            data = self.request_json(url, headers=headers, params=params)
 
-            for episode_url in self.get_episode_urls(page):
-                yield Message.Queue, episode_url, data
+            path = data["webtoonLevelCode"].lower().replace("_c", "C", 1)
+            base = f"{self.root}/{path}/detail?titleId={data['titleId']}&no="
 
-            if 'class="next"' not in page:
+            for article in data["articleList"]:
+                article["_extractor"] = NaverWebtoonEpisodeExtractor
+                yield Message.Queue, base + str(article["no"]), article
+
+            params["page"] = data["pageInfo"]["nextPage"]
+            if not params["page"]:
                 return
-            params["page"] += 1
-
-    def get_episode_urls(self, page):
-        """Extract and return all episode urls in page"""
-        return [
-            self.root + "/webtoon/detail.nhn?" + query
-            for query in text.extract_iter(
-                page, '<a href="/webtoon/detail?', '"')
-        ][::2]

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -19,34 +19,13 @@ class KeenspotComicExtractor(Extractor):
     directory_fmt = ("{category}", "{comic}")
     filename_fmt = "{filename}.{extension}"
     archive_fmt = "{comic}_{filename}"
-    pattern = r"(?:https?://)?(?!www\.|forums\.)([^.]+)\.keenspot\.com(/.+)?"
-    test = (
-        ("http://marksmen.keenspot.com/", {  # link
-            "range": "1-3",
-            "url": "83bcf029103bf8bc865a1988afa4aaeb23709ba6",
-        }),
-        ("http://barkercomic.keenspot.com/", {  # id
-            "range": "1-3",
-            "url": "c4080926db18d00bac641fdd708393b7d61379e6",
-        }),
-        ("http://crowscare.keenspot.com/", {  # id v2
-            "range": "1-3",
-            "url": "a00e66a133dd39005777317da90cef921466fcaa"
-        }),
-        ("http://supernovas.keenspot.com/", {  # ks
-            "range": "1-3",
-            "url": "de21b12887ef31ff82edccbc09d112e3885c3aab"
-        }),
-        ("http://twokinds.keenspot.com/comic/1066/", {  # "random" access
-            "range": "1-3",
-            "url": "6a784e11370abfb343dcad9adbb7718f9b7be350",
-        })
-    )
+    pattern = r"(?:https?://)?(?!www\.|forums\.)([\w-]+)\.keenspot\.com(/.+)?"
+    example = "http://COMIC.keenspot.com/"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.comic = match.group(1).lower()
-        self.path = match.group(2)
+        self.comic = match[1].lower()
+        self.path = match[2]
         self.root = "http://" + self.comic + ".keenspot.com"
 
         self._needle = ""
@@ -55,7 +34,7 @@ class KeenspotComicExtractor(Extractor):
 
     def items(self):
         data = {"comic": self.comic}
-        yield Message.Directory, data
+        yield Message.Directory, "", data
 
         with self.request(self.root + "/") as response:
             if response.history:
@@ -96,8 +75,7 @@ class KeenspotComicExtractor(Extractor):
             self._image = '<div id="comic">'
             return "http://brawlinthefamily.keenspot.com/comic/theshowdown/"
 
-        url = text.extract(page, '<link rel="first" href="', '"')[0]
-        if url:
+        if url := text.extr(page, '<link rel="first" href="', '"'):
             if self.comic == "porcelain":
                 self._needle = 'id="porArchivetop_"'
             else:
@@ -107,7 +85,7 @@ class KeenspotComicExtractor(Extractor):
         pos = page.find('id="first_day1"')
         if pos >= 0:
             self._next = self._next_id
-            return text.rextract(page, 'href="', '"', pos)[0]
+            return text.rextr(page, 'href="', '"', pos)
 
         pos = page.find('>FIRST PAGE<')
         if pos >= 0:
@@ -116,7 +94,7 @@ class KeenspotComicExtractor(Extractor):
                 self._image = '<div id="comic">'
             else:
                 self._next = self._next_id
-            return text.rextract(page, 'href="', '"', pos)[0]
+            return text.rextr(page, 'href="', '"', pos)
 
         pos = page.find('<div id="kscomicpart"')
         if pos >= 0:
@@ -127,13 +105,13 @@ class KeenspotComicExtractor(Extractor):
         if pos >= 0:
             self._image = '</header>'
             self._needle = 'class="navarchive"'
-            return text.rextract(page, 'href="', '"', pos)[0]
+            return text.rextr(page, 'href="', '"', pos)
 
         pos = page.find('id="flip_FirstDay"')  # flipside
         if pos >= 0:
             self._image = 'class="flip_Pages ksc"'
             self._needle = 'id="flip_ArcButton"'
-            return text.rextract(page, 'href="', '"', pos)[0]
+            return text.rextr(page, 'href="', '"', pos)
 
         self.log.error("Unrecognized page layout")
         return None
@@ -142,22 +120,18 @@ class KeenspotComicExtractor(Extractor):
         pos = page.index(self._needle) + len(self._needle)
         return text.extract(page, 'href="', '"', pos)[0]
 
-    @staticmethod
-    def _next_link(page):
-        return text.extract(page, '<link rel="next" href="', '"')[0]
+    def _next_link(self, page):
+        return text.extr(page, '<link rel="next" href="', '"')
 
-    @staticmethod
-    def _next_id(page):
+    def _next_id(self, page):
         pos = page.find('id="next_')
-        return text.rextract(page, 'href="', '"', pos)[0] if pos >= 0 else None
+        return text.rextr(page, 'href="', '"', pos) if pos >= 0 else None
 
-    @staticmethod
-    def _next_lastblood(page):
+    def _next_lastblood(self, page):
         pos = page.index("link rel='next'")
         return text.extract(page, "href='", "'", pos)[0]
 
-    @staticmethod
-    def _next_brawl(page):
+    def _next_brawl(self, page):
         pos = page.index("comic-nav-next")
-        url = text.rextract(page, 'href="', '"', pos)[0]
+        url = text.rextr(page, 'href="', '"', pos)
         return None if "?random" in url else url

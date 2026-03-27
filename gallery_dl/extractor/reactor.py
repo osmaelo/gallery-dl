@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2021 Mike Fährmann
+# Copyright 2019-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -8,36 +8,37 @@
 
 """Generic extractors for *reactor sites"""
 
-from .common import Extractor, Message
-from .. import text
+from .common import BaseExtractor, Message
+from .. import text, util
 import urllib.parse
-import json
-
-BASE_PATTERN = r"(?:https?://)?((?:[^/.]+\.)?reactor\.cc)"
 
 
-class ReactorExtractor(Extractor):
+class ReactorExtractor(BaseExtractor):
     """Base class for *reactor.cc extractors"""
     basecategory = "reactor"
     filename_fmt = "{post_id}_{num:>02}{title[:100]:?_//}.{extension}"
     archive_fmt = "{post_id}_{num}"
-    instances = ()
-    request_interval = 5.0
+    request_interval = (3.0, 6.0)
 
     def __init__(self, match):
-        Extractor.__init__(self, match)
-        self.root = "http://" + match.group(1)
-        self.session.headers["Referer"] = self.root
-        self.gif = self.config("gif", False)
+        BaseExtractor.__init__(self, match)
 
-        if not self.category:
+        url = text.ensure_http_scheme(match[0], "http://")
+        pos = url.index("/", 10)
+        self.root = url[:pos]
+        self.path = url[pos:]
+
+        if self.category == "reactor":
             # set category based on domain name
             netloc = urllib.parse.urlsplit(self.root).netloc
             self.category = netloc.rpartition(".")[0]
 
+    def _init(self):
+        self.gif = self.config("gif", False)
+
     def items(self):
         data = self.metadata()
-        yield Message.Directory, data
+        yield Message.Directory, "", data
         for post in self.posts():
             for image in self._parse_post(post):
                 url = image["url"]
@@ -50,7 +51,7 @@ class ReactorExtractor(Extractor):
 
     def posts(self):
         """Return all relevant post-objects"""
-        return self._pagination(self.url)
+        return self._pagination(self.root + self.path)
 
     def _pagination(self, url):
         while True:
@@ -84,19 +85,19 @@ class ReactorExtractor(Extractor):
         script = script[:script.index("</")].strip()
 
         try:
-            data = json.loads(script)
+            data = util.json_loads(script)
         except ValueError:
             try:
                 # remove control characters and escape backslashes
                 mapping = dict.fromkeys(range(32))
                 script = script.translate(mapping).replace("\\", "\\\\")
-                data = json.loads(script)
+                data = util.json_loads(script)
             except ValueError as exc:
                 self.log.warning("Unable to parse JSON data: %s", exc)
                 return
 
         num = 0
-        date = text.parse_datetime(data["datePublished"])
+        date = self.parse_datetime_iso(data["datePublished"])
         user = data["author"]["name"]
         description = text.unescape(data["description"])
         title, _, tags = text.unescape(data["headline"]).partition(" / ")
@@ -109,13 +110,13 @@ class ReactorExtractor(Extractor):
         tags.sort()
 
         for image in images:
-            url = text.extract(image, ' src="', '"')[0]
+            url = text.extr(image, ' src="', '"')
             if not url:
                 continue
             if url.startswith("//"):
                 url = "http:" + url
-            width = text.extract(image, ' width="', '"')[0]
-            height = text.extract(image, ' height="', '"')[0]
+            width = text.extr(image, ' width="', '"')
+            height = text.extr(image, ' height="', '"')
             image_id = url.rpartition("-")[2].partition(".")[0]
             num += 1
 
@@ -125,7 +126,7 @@ class ReactorExtractor(Extractor):
                 url = url.replace("/post/", "/post/full/")
 
             if self.gif and ("/post/webm/" in url or "/post/mp4/" in url):
-                gif_url = text.extract(image, '<a href="', '"')[0]
+                gif_url = text.extr(image, '<a href="', '"')
                 if not gif_url:
                     continue
                 url = gif_url
@@ -145,29 +146,52 @@ class ReactorExtractor(Extractor):
             }
 
 
+BASE_PATTERN = ReactorExtractor.update({
+    "reactor"    : {
+        "root": "http://reactor.cc",
+        "pattern": r"(?:[^/.]+\.)?reactor\.cc",
+    },
+    "pornreactor": {
+        "root": "http://pornreactor.cc",
+        "pattern": r"(?:www\.)?(?:pornreactor\.cc|fapreactor.com)",
+    },
+    "thatpervert": {
+        "root": "http://thatpervert.com",
+        "pattern": r"thatpervert\.com",
+    },
+})
+
+
 class ReactorTagExtractor(ReactorExtractor):
     """Extractor for tag searches on *reactor.cc sites"""
     subcategory = "tag"
     directory_fmt = ("{category}", "{search_tags}")
     archive_fmt = "{search_tags}_{post_id}_{num}"
-    pattern = BASE_PATTERN + r"/tag/([^/?#]+)"
-    test = ("http://anime.reactor.cc/tag/Anime+Art",)
+    pattern = BASE_PATTERN + r"/tag/([^/?#]+)(?:/[^/?#]+)?"
+    example = "http://reactor.cc/tag/TAG"
 
     def __init__(self, match):
         ReactorExtractor.__init__(self, match)
-        self.tag = match.group(2)
+        self.tag = self.groups[-1]
 
     def metadata(self):
         return {"search_tags": text.unescape(self.tag).replace("+", " ")}
 
 
-class ReactorSearchExtractor(ReactorTagExtractor):
+class ReactorSearchExtractor(ReactorExtractor):
     """Extractor for search results on *reactor.cc sites"""
     subcategory = "search"
     directory_fmt = ("{category}", "search", "{search_tags}")
     archive_fmt = "s_{search_tags}_{post_id}_{num}"
     pattern = BASE_PATTERN + r"/search(?:/|\?q=)([^/?#]+)"
-    test = ("http://anime.reactor.cc/search?q=Art",)
+    example = "http://reactor.cc/search?q=QUERY"
+
+    def __init__(self, match):
+        ReactorExtractor.__init__(self, match)
+        self.tag = self.groups[-1]
+
+    def metadata(self):
+        return {"search_tags": text.unescape(self.tag).replace("+", " ")}
 
 
 class ReactorUserExtractor(ReactorExtractor):
@@ -175,11 +199,11 @@ class ReactorUserExtractor(ReactorExtractor):
     subcategory = "user"
     directory_fmt = ("{category}", "user", "{user}")
     pattern = BASE_PATTERN + r"/user/([^/?#]+)"
-    test = ("http://anime.reactor.cc/user/Shuster",)
+    example = "http://reactor.cc/user/USER"
 
     def __init__(self, match):
         ReactorExtractor.__init__(self, match)
-        self.user = match.group(2)
+        self.user = self.groups[-1]
 
     def metadata(self):
         return {"user": text.unescape(self.user).replace("+", " ")}
@@ -189,154 +213,17 @@ class ReactorPostExtractor(ReactorExtractor):
     """Extractor for single posts on *reactor.cc sites"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"/post/(\d+)"
-    test = ("http://anime.reactor.cc/post/3576250",)
+    example = "http://reactor.cc/post/12345"
 
     def __init__(self, match):
         ReactorExtractor.__init__(self, match)
-        self.post_id = match.group(2)
+        self.post_id = self.groups[-1]
 
     def items(self):
-        post = self.request(self.url).text
+        post = self.request(self.root + self.path).text
         pos = post.find('class="uhead">')
         for image in self._parse_post(post[pos:]):
             if image["num"] == 1:
-                yield Message.Directory, image
+                yield Message.Directory, "", image
             url = image["url"]
             yield Message.Url, url, text.nameext_from_url(url, image)
-
-
-# --------------------------------------------------------------------
-# JoyReactor
-
-JR_BASE_PATTERN = r"(?:https?://)?(?:www\.)?(joyreactor\.c(?:c|om))"
-
-
-class JoyreactorTagExtractor(ReactorTagExtractor):
-    """Extractor for tag searches on joyreactor.cc"""
-    category = "joyreactor"
-    pattern = JR_BASE_PATTERN + r"/tag/([^/?#]+)"
-    test = (
-        ("http://joyreactor.cc/tag/Advent+Cirno", {
-            "count": ">= 15",
-        }),
-        ("http://joyreactor.com/tag/Cirno", {
-            "url": "aa59090590b26f4654881301fe8fe748a51625a8",
-        }),
-    )
-
-
-class JoyreactorSearchExtractor(ReactorSearchExtractor):
-    """Extractor for search results on joyreactor.cc"""
-    category = "joyreactor"
-    pattern = JR_BASE_PATTERN + r"/search(?:/|\?q=)([^/?#]+)"
-    test = (
-        ("http://joyreactor.cc/search/Nature", {
-            "range": "1-25",
-            "count": ">= 20",
-        }),
-        ("http://joyreactor.com/search?q=Nature", {
-            "range": "1-25",
-            "count": ">= 20",
-        }),
-    )
-
-
-class JoyreactorUserExtractor(ReactorUserExtractor):
-    """Extractor for all posts of a user on joyreactor.cc"""
-    category = "joyreactor"
-    pattern = JR_BASE_PATTERN + r"/user/([^/?#]+)"
-    test = (
-        ("http://joyreactor.cc/user/hemantic"),
-        ("http://joyreactor.com/user/Tacoman123", {
-            "url": "60ce9a3e3db791a0899f7fb7643b5b87d09ae3b5",
-        }),
-    )
-
-
-class JoyreactorPostExtractor(ReactorPostExtractor):
-    """Extractor for single posts on joyreactor.cc"""
-    category = "joyreactor"
-    pattern = JR_BASE_PATTERN + r"/post/(\d+)"
-    test = (
-        ("http://joyreactor.com/post/3721876", {  # single image
-            "pattern": r"http://img\d\.joyreactor\.com/pics/post/full"
-                       r"/cartoon-painting-monster-lake-4841316.jpeg",
-            "count": 1,
-            "keyword": "2207a7dfed55def2042b6c2554894c8d7fda386e",
-        }),
-        ("http://joyreactor.com/post/3713804", {  # 4 images
-            "pattern": r"http://img\d\.joyreactor\.com/pics/post/full"
-                       r"/movie-tv-godzilla-monsters-\d+\.jpeg",
-            "count": 4,
-            "keyword": "d7da9ba7809004c809eedcf6f1c06ad0fbb3df21",
-        }),
-        ("http://joyreactor.com/post/3726210", {  # gif / video
-            "url": "60f3b9a0a3918b269bea9b4f8f1a5ab3c2c550f8",
-            "keyword": "8949d9d5fc469dab264752432efbaa499561664a",
-        }),
-        ("http://joyreactor.com/post/3668724", {  # youtube embed
-            "url": "bf1666eddcff10c9b58f6be63fa94e4e13074214",
-            "keyword": "e18b1ffbd79d76f9a0e90b6d474cc2499e343f0b",
-        }),
-        ("http://joyreactor.cc/post/1299", {  # "malformed" JSON
-            "url": "ab02c6eb7b4035ad961b29ee0770ee41be2fcc39",
-        }),
-    )
-
-
-# --------------------------------------------------------------------
-# PornReactor
-
-PR_BASE_PATTERN = r"(?:https?://)?(?:www\.)?(pornreactor\.cc|fapreactor.com)"
-
-
-class PornreactorTagExtractor(ReactorTagExtractor):
-    """Extractor for tag searches on pornreactor.cc"""
-    category = "pornreactor"
-    pattern = PR_BASE_PATTERN + r"/tag/([^/?#]+)"
-    test = (
-        ("http://pornreactor.cc/tag/RiceGnat", {
-            "range": "1-25",
-            "count": ">= 25",
-        }),
-        ("http://fapreactor.com/tag/RiceGnat"),
-    )
-
-
-class PornreactorSearchExtractor(ReactorSearchExtractor):
-    """Extractor for search results on pornreactor.cc"""
-    category = "pornreactor"
-    pattern = PR_BASE_PATTERN + r"/search(?:/|\?q=)([^/?#]+)"
-    test = (
-        ("http://pornreactor.cc/search?q=ecchi+hentai"),
-        ("http://fapreactor.com/search/ecchi+hentai"),
-    )
-
-
-class PornreactorUserExtractor(ReactorUserExtractor):
-    """Extractor for all posts of a user on pornreactor.cc"""
-    category = "pornreactor"
-    pattern = PR_BASE_PATTERN + r"/user/([^/?#]+)"
-    test = (
-        ("http://pornreactor.cc/user/Disillusion", {
-            "range": "1-25",
-            "count": ">= 20",
-        }),
-        ("http://fapreactor.com/user/Disillusion"),
-    )
-
-
-class PornreactorPostExtractor(ReactorPostExtractor):
-    """Extractor for single posts on pornreactor.cc"""
-    category = "pornreactor"
-    subcategory = "post"
-    pattern = PR_BASE_PATTERN + r"/post/(\d+)"
-    test = (
-        ("http://pornreactor.cc/post/863166", {
-            "url": "a09fb0577489e1f9564c25d0ad576f81b19c2ef3",
-            "content": "ec6b0568bfb1803648744077da082d14de844340",
-        }),
-        ("http://fapreactor.com/post/863166", {
-            "url": "2a956ce0c90e8bc47b4392db4fa25ad1342f3e54",
-        }),
-    )

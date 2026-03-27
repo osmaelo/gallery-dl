@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2021 Mike Fährmann
+# Copyright 2021-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,8 +9,7 @@
 """Extractors for Philomena sites"""
 
 from .booru import BooruExtractor
-from .. import text, exception
-import operator
+from .. import text
 
 
 class PhilomenaExtractor(BooruExtractor):
@@ -18,121 +17,55 @@ class PhilomenaExtractor(BooruExtractor):
     basecategory = "philomena"
     filename_fmt = "{filename}.{extension}"
     archive_fmt = "{id}"
-    request_interval = 1.0
+    request_interval = (0.5, 1.5)
+    page_start = 1
     per_page = 50
 
-    _file_url = operator.itemgetter("view_url")
+    def _init(self):
+        self.api = PhilomenaAPI(self)
+        self.svg = self.config("svg", True)
 
-    @staticmethod
-    def _prepare(post):
-        post["date"] = text.parse_datetime(post["created_at"])
+    def _file_url(self, post):
+        try:
+            url = post["representations"]["full"]
+        except Exception:
+            url = post["view_url"]
 
-    @staticmethod
-    def _extended_tags(post):
-        pass
+        if self.svg and post["format"] == "svg":
+            return url.rpartition(".")[0] + ".svg"
+        return url
 
-    def _pagination(self, url, params):
-        params["page"] = 1
-        params["per_page"] = self.per_page
-
-        api_key = self.config("api-key")
-        if api_key:
-            params["key"] = api_key
-
-        filter_id = self.config("filter")
-        if filter_id:
-            params["filter_id"] = filter_id
-        elif not api_key:
-            try:
-                params["filter_id"] = INSTANCES[self.category]["filter_id"]
-            except (KeyError, TypeError):
-                pass
-
-        while True:
-            data = self.request(url, params=params).json()
-            yield from data["images"]
-
-            if len(data["images"]) < self.per_page:
-                return
-            params["page"] += 1
+    def _prepare(self, post):
+        post["date"] = self.parse_datetime_iso(post["created_at"][:19])
 
 
-INSTANCES = {
-    "derpibooru": {"root": "https://derpibooru.org",
-                   "filter_id": "56027"},
-    "ponybooru" : {"root": "https://ponybooru.org",
-                   "filter_id": "2"},
-}
-
-BASE_PATTERN = PhilomenaExtractor.update(INSTANCES)
+BASE_PATTERN = PhilomenaExtractor.update({
+    "derpibooru": {
+        "root": "https://derpibooru.org",
+        "pattern": r"(?:www\.)?derpibooru\.org",
+        "filter_id": "56027",
+    },
+    "ponybooru": {
+        "root": "https://ponybooru.org",
+        "pattern": r"(?:www\.)?ponybooru\.org",
+        "filter_id": "3",
+    },
+    "furbooru": {
+        "root": "https://furbooru.org",
+        "pattern": r"furbooru\.org",
+        "filter_id": "2",
+    },
+})
 
 
 class PhilomenaPostExtractor(PhilomenaExtractor):
     """Extractor for single posts on a Philomena booru"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"/(?:images/)?(\d+)"
-    test = (
-        ("https://derpibooru.org/images/1", {
-            "content": "88449eeb0c4fa5d3583d0b794f6bc1d70bf7f889",
-            "count": 1,
-            "keyword": {
-                "animated": False,
-                "aspect_ratio": 1.0,
-                "comment_count": int,
-                "created_at": "2012-01-02T03:12:33Z",
-                "date": "dt:2012-01-02 03:12:33",
-                "deletion_reason": None,
-                "description": "",
-                "downvotes": int,
-                "duplicate_of": None,
-                "duration": 0.04,
-                "extension": "png",
-                "faves": int,
-                "first_seen_at": "2012-01-02T03:12:33Z",
-                "format": "png",
-                "height": 900,
-                "hidden_from_users": False,
-                "id": 1,
-                "mime_type": "image/png",
-                "name": "1__safe_fluttershy_solo_cloud_happy_flying_upvotes+ga"
-                        "lore_artist-colon-speccysy_get_sunshine",
-                "orig_sha512_hash": None,
-                "processed": True,
-                "representations": dict,
-                "score": int,
-                "sha512_hash": "f16c98e2848c2f1bfff3985e8f1a54375cc49f78125391"
-                               "aeb80534ce011ead14e3e452a5c4bc98a66f56bdfcd07e"
-                               "f7800663b994f3f343c572da5ecc22a9660f",
-                "size": 860914,
-                "source_url": "https://www.deviantart.com/speccysy/art"
-                              "/Afternoon-Flight-215193985",
-                "spoilered": False,
-                "tag_count": 42,
-                "tag_ids": list,
-                "tags": list,
-                "thumbnails_generated": True,
-                "updated_at": "2021-09-30T20:04:01Z",
-                "uploader": "Clover the Clever",
-                "uploader_id": 211188,
-                "upvotes": int,
-                "view_url": str,
-                "width": 900,
-                "wilson_score": float,
-            },
-        }),
-        ("https://derpibooru.org/1"),
-        ("https://ponybooru.org/images/1", {
-            "content": "bca26f58fafd791fe07adcd2a28efd7751824605",
-        }),
-    )
-
-    def __init__(self, match):
-        PhilomenaExtractor.__init__(self, match)
-        self.image_id = match.group(match.lastindex)
+    example = "https://derpibooru.org/images/12345"
 
     def posts(self):
-        url = self.root + "/api/v1/json/images/" + self.image_id
-        return (self.request(url).json()["image"],)
+        return (self.api.image(self.groups[-1]),)
 
 
 class PhilomenaSearchExtractor(PhilomenaExtractor):
@@ -140,30 +73,13 @@ class PhilomenaSearchExtractor(PhilomenaExtractor):
     subcategory = "search"
     directory_fmt = ("{category}", "{search_tags}")
     pattern = BASE_PATTERN + r"/(?:search/?\?([^#]+)|tags/([^/?#]+))"
-    test = (
-        ("https://derpibooru.org/search?q=cute", {
-            "range": "40-60",
-            "count": 21,
-        }),
-        ("https://derpibooru.org/tags/cute", {
-            "range": "40-60",
-            "count": 21,
-        }),
-        (("https://derpibooru.org/tags/"
-          "artist-colon--dash-_-fwslash--fwslash-%255Bkorroki%255D_aternak"), {
-            "count": ">= 2",
-        }),
-        ("https://ponybooru.org/search?q=cute", {
-            "range": "40-60",
-            "count": 21,
-        }),
-    )
+    example = "https://derpibooru.org/search?q=QUERY"
 
     def __init__(self, match):
         PhilomenaExtractor.__init__(self, match)
-        groups = match.groups()
-        if groups[-1]:
-            q = groups[-1]
+
+        if q := self.groups[-1]:
+            q = q.replace("+", " ")
             for old, new in (
                 ("-colon-"  , ":"),
                 ("-dash-"   , "-"),
@@ -176,14 +92,13 @@ class PhilomenaSearchExtractor(PhilomenaExtractor):
                     q = q.replace(old, new)
             self.params = {"q": text.unquote(text.unquote(q))}
         else:
-            self.params = text.parse_query(groups[-2])
+            self.params = text.parse_query(self.groups[-2])
 
     def metadata(self):
         return {"search_tags": self.params.get("q", "")}
 
     def posts(self):
-        url = self.root + "/api/v1/json/search/images"
-        return self._pagination(url, self.params)
+        return self.api.search(self.params)
 
 
 class PhilomenaGalleryExtractor(PhilomenaExtractor):
@@ -192,40 +107,78 @@ class PhilomenaGalleryExtractor(PhilomenaExtractor):
     directory_fmt = ("{category}", "galleries",
                      "{gallery[id]} {gallery[title]}")
     pattern = BASE_PATTERN + r"/galleries/(\d+)"
-    test = (
-        ("https://derpibooru.org/galleries/1", {
-            "pattern": r"https://derpicdn\.net/img/view/\d+/\d+/\d+/\d+[^/]+$",
-            "keyword": {
-                "gallery": {
-                    "description": "Indexes start at 1 :P",
-                    "id": 1,
-                    "spoiler_warning": "",
-                    "thumbnail_id": 1,
-                    "title": "The Very First Gallery",
-                    "user": "DeliciousBlackInk",
-                    "user_id": 365446,
-                },
-            },
-        }),
-        ("https://ponybooru.org/galleries/27", {
-            "count": ">= 24",
-        }),
-    )
-
-    def __init__(self, match):
-        PhilomenaExtractor.__init__(self, match)
-        self.gallery_id = match.group(match.lastindex)
+    example = "https://derpibooru.org/galleries/12345"
 
     def metadata(self):
-        url = self.root + "/api/v1/json/search/galleries"
-        params = {"q": "id:" + self.gallery_id}
-        galleries = self.request(url, params=params).json()["galleries"]
-        if not galleries:
-            raise exception.NotFoundError("gallery")
-        return {"gallery": galleries[0]}
+        try:
+            return {"gallery": self.api.gallery(self.groups[-1])}
+        except IndexError:
+            raise self.exc.NotFoundError("gallery")
 
     def posts(self):
-        gallery_id = "gallery_id:" + self.gallery_id
-        url = self.root + "/api/v1/json/search/images"
-        params = {"sd": "desc", "sf": gallery_id, "q" : gallery_id}
-        return self._pagination(url, params)
+        gallery_id = "gallery_id:" + self.groups[-1]
+        params = {"sd": "desc", "sf": gallery_id, "q": gallery_id}
+        return self.api.search(params)
+
+
+class PhilomenaAPI():
+    """Interface for the Philomena API
+
+    https://www.derpibooru.org/pages/api
+    """
+
+    def __init__(self, extractor):
+        self.extractor = extractor
+        self.root = extractor.root + "/api"
+
+    def gallery(self, gallery_id):
+        endpoint = "/v1/json/search/galleries"
+        params = {"q": "id:" + gallery_id}
+        return self._call(endpoint, params)["galleries"][0]
+
+    def image(self, image_id):
+        endpoint = "/v1/json/images/" + image_id
+        return self._call(endpoint)["image"]
+
+    def search(self, params):
+        endpoint = "/v1/json/search/images"
+        return self._pagination(endpoint, params)
+
+    def _call(self, endpoint, params=None):
+        url = self.root + endpoint
+
+        while True:
+            response = self.extractor.request(url, params=params, fatal=None)
+
+            if response.status_code < 400:
+                return response.json()
+
+            if response.status_code == 429:
+                self.extractor.wait(seconds=600)
+                continue
+
+            # error
+            self.extractor.log.debug(response.content)
+            raise self.extractor.exc.HttpError("", response)
+
+    def _pagination(self, endpoint, params):
+        extr = self.extractor
+
+        if api_key := extr.config("api-key"):
+            params["key"] = api_key
+
+        if filter_id := extr.config("filter"):
+            params["filter_id"] = filter_id
+        elif not api_key:
+            params["filter_id"] = extr.config_instance("filter_id") or "2"
+
+        params["page"] = extr.page_start
+        params["per_page"] = extr.per_page
+
+        while True:
+            data = self._call(endpoint, params)
+            yield from data["images"]
+
+            if len(data["images"]) < extr.per_page:
+                return
+            params["page"] += 1

@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2014-2019 Mike Fährmann
+# Copyright 2014-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
 # published by the Free Software Foundation.
 
-"""Extract images from galleries at https://imgbox.com/"""
+"""Extractors for https://imgbox.com/"""
 
 from .common import Extractor, Message, AsynchronousMixin
-from .. import text, exception
-import re
+from .. import text
 
 
 class ImgboxExtractor(Extractor):
@@ -20,7 +19,7 @@ class ImgboxExtractor(Extractor):
 
     def items(self):
         data = self.get_job_metadata()
-        yield Message.Directory, data
+        yield Message.Directory, "", data
 
         for image_key in self.get_image_keys():
             imgpage = self.request(self.root + "/" + image_key).text
@@ -31,18 +30,15 @@ class ImgboxExtractor(Extractor):
                 text.nameext_from_url(imgdata["filename"], imgdata)
                 yield Message.Url, self.get_image_url(imgpage), imgdata
 
-    @staticmethod
-    def get_job_metadata():
+    def get_job_metadata(self):
         """Collect metadata for extractor-job"""
         return {}
 
-    @staticmethod
-    def get_image_keys():
+    def get_image_keys(self):
         """Return an iterable containing all image-keys"""
         return []
 
-    @staticmethod
-    def get_image_metadata(page):
+    def get_image_metadata(self, page):
         """Collect metadata for a downloadable file"""
         return text.extract_all(page, (
             ("num"      , '</a> &nbsp; ', ' of '),
@@ -50,11 +46,9 @@ class ImgboxExtractor(Extractor):
             ("filename" , ' title="', '"'),
         ))[0]
 
-    @staticmethod
-    def get_image_url(page):
+    def get_image_url(self, page):
         """Extract download-url"""
-        pos = page.index(">Image</a>")
-        return text.extract(page, '<a href="', '"', pos)[0]
+        return text.extr(page, 'property="og:image" content="', '"')
 
 
 class ImgboxGalleryExtractor(AsynchronousMixin, ImgboxExtractor):
@@ -64,33 +58,21 @@ class ImgboxGalleryExtractor(AsynchronousMixin, ImgboxExtractor):
     filename_fmt = "{num:>03}-{filename}.{extension}"
     archive_fmt = "{gallery_key}_{image_key}"
     pattern = r"(?:https?://)?(?:www\.)?imgbox\.com/g/([A-Za-z0-9]{10})"
-    test = (
-        ("https://imgbox.com/g/JaX5V5HX7g", {
-            "url": "678f0bca1251d810372326ea4f16582cafa800e4",
-            "keyword": "4b1e62820ac2c6205b7ad0b6322cc8e00dbe1b0c",
-            "content": "d20307dc8511ac24d688859c55abf2e2cc2dd3cc",
-        }),
-        ("https://imgbox.com/g/cUGEkRbdZZ", {
-            "url": "d839d47cbbbeb121f83c520072512f7e51f52107",
-            "keyword": "fb0427b87983197849fb2887905e758f3e50cb6e",
-        }),
-        ("https://imgbox.com/g/JaX5V5HX7h", {
-            "exception": exception.NotFoundError,
-        }),
-    )
+    example = "https://imgbox.com/g/12345abcde"
 
     def __init__(self, match):
         ImgboxExtractor.__init__(self, match)
-        self.gallery_key = match.group(1)
+        self.gallery_key = match[1]
         self.image_keys = []
 
     def get_job_metadata(self):
         page = self.request(self.root + "/g/" + self.gallery_key).text
         if "The specified gallery could not be found." in page:
-            raise exception.NotFoundError("gallery")
-        self.image_keys = re.findall(r'<a href="/([^"]+)"><img alt="', page)
+            raise self.exc.NotFoundError("gallery")
+        self.image_keys = text.re(
+            r'<a href="/([^"]+)"><img alt="').findall(page)
 
-        title = text.extract(page, "<h1>", "</h1>")[0]
+        title = text.extr(page, "<h1>", "</h1>")
         title, _, count = title.rpartition(" - ")
         return {
             "gallery_key": self.gallery_key,
@@ -106,28 +88,21 @@ class ImgboxImageExtractor(ImgboxExtractor):
     """Extractor for single images from imgbox.com"""
     subcategory = "image"
     archive_fmt = "{image_key}"
-    pattern = r"(?:https?://)?(?:www\.)?imgbox\.com/([A-Za-z0-9]{8})"
-    test = (
-        ("https://imgbox.com/qHhw7lpG", {
-            "url": "d931f675a9b848fa7cb9077d6c2b14eb07bdb80f",
-            "keyword": "dfc72310026b45f3feb4f9cada20c79b2575e1af",
-            "content": "0c8768055e4e20e7c7259608b67799171b691140",
-        }),
-        ("https://imgbox.com/qHhw7lpH", {
-            "exception": exception.NotFoundError,
-        }),
-    )
+    pattern = (r"(?:https?://)?(?:"
+               r"(?:www\.|i\.)?imgbox\.com|"
+               r"images\d+\.imgbox\.com/[0-9a-f]{2}/[0-9a-f]{2}"
+               r")/([A-Za-z0-9]{8})")
+    example = "https://imgbox.com/1234abcd"
 
     def __init__(self, match):
         ImgboxExtractor.__init__(self, match)
-        self.image_key = match.group(1)
+        self.image_key = match[1]
 
     def get_image_keys(self):
         return (self.image_key,)
 
-    @staticmethod
-    def get_image_metadata(page):
-        data = ImgboxExtractor.get_image_metadata(page)
+    def get_image_metadata(self, page):
+        data = ImgboxExtractor.get_image_metadata(self, page)
         if not data["filename"]:
-            raise exception.NotFoundError("image")
+            raise self.exc.NotFoundError("image")
         return data

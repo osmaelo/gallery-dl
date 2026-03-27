@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2021 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -23,11 +23,11 @@ class WikiartExtractor(Extractor):
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.lang = match.group(1)
+        self.lang = match[1]
 
     def items(self):
         data = self.metadata()
-        yield Message.Directory, data
+        yield Message.Directory, "", data
         for painting in self.paintings():
             url = painting["image"]
             painting.update(data)
@@ -54,7 +54,7 @@ class WikiartExtractor(Extractor):
             params.update(extra_params)
 
         while True:
-            data = self.request(url, headers=headers, params=params).json()
+            data = self.request_json(url, headers=headers, params=params)
             items = data.get(key)
             if not items:
                 return
@@ -69,24 +69,20 @@ class WikiartArtistExtractor(WikiartExtractor):
     subcategory = "artist"
     directory_fmt = ("{category}", "{artist[artistName]}")
     pattern = BASE_PATTERN + r"/(?!\w+-by-)([\w-]+)/?$"
-    test = ("https://www.wikiart.org/en/thomas-cole", {
-        "url": "deabec0ed7efa97e2a729ff9d08b539143106bac",
-        "keyword": "751a5457b71c8704982d3bb6485a214cd3d07bf9",
-    })
+    example = "https://www.wikiart.org/en/ARTIST"
 
     def __init__(self, match):
         WikiartExtractor.__init__(self, match)
-        self.artist_name = match.group(2)
+        self.artist_name = match[2]
         self.artist = None
 
     def metadata(self):
-        url = "{}/{}/{}?json=2".format(self.root, self.lang, self.artist_name)
-        self.artist = self.request(url).json()
+        url = f"{self.root}/{self.lang}/{self.artist_name}?json=2"
+        self.artist = self.request_json(url)
         return {"artist": self.artist}
 
     def paintings(self):
-        url = "{}/{}/{}/mode/all-paintings".format(
-            self.root, self.lang, self.artist_name)
+        url = f"{self.root}/{self.lang}/{self.artist_name}/mode/all-paintings"
         return self._pagination(url)
 
 
@@ -94,29 +90,18 @@ class WikiartImageExtractor(WikiartArtistExtractor):
     """Extractor for individual paintings on wikiart.org"""
     subcategory = "image"
     pattern = BASE_PATTERN + r"/(?!(?:paintings|artists)-by-)([\w-]+)/([\w-]+)"
-    test = (
-        ("https://www.wikiart.org/en/thomas-cole/the-departure-1838", {
-            "url": "976cc2545f308a650b5dbb35c29d3cee0f4673b3",
-            "keyword": "8e80cdcb01c1fedb934633d1c4c3ab0419cfbedf",
-        }),
-        # no year or '-' in slug
-        ("https://www.wikiart.org/en/huang-shen/summer", {
-            "url": "d7f60118c34067b2b37d9577e412dc1477b94207",
-        }),
-    )
+    example = "https://www.wikiart.org/en/ARTIST/TITLE"
 
     def __init__(self, match):
         WikiartArtistExtractor.__init__(self, match)
-        self.title = match.group(3)
+        self.title = match[3]
 
     def paintings(self):
         title, sep, year = self.title.rpartition("-")
         if not sep or not year.isdecimal():
             title = self.title
-        url = "{}/{}/Search/{} {}".format(
-            self.root, self.lang,
-            self.artist.get("artistName") or self.artist_name, title,
-        )
+        url = (f"{self.root}/{self.lang}/Search/"
+               f"{self.artist.get('artistName') or self.artist_name} {title}")
         return self._pagination(url, stop=True)
 
 
@@ -125,21 +110,18 @@ class WikiartArtworksExtractor(WikiartExtractor):
     subcategory = "artworks"
     directory_fmt = ("{category}", "Artworks by {group!c}", "{type}")
     pattern = BASE_PATTERN + r"/paintings-by-([\w-]+)/([\w-]+)"
-    test = ("https://www.wikiart.org/en/paintings-by-media/grisaille", {
-        "url": "36e054fcb3363b7f085c81f4778e6db3994e56a3",
-    })
+    example = "https://www.wikiart.org/en/paintings-by-GROUP/TYPE"
 
     def __init__(self, match):
         WikiartExtractor.__init__(self, match)
-        self.group = match.group(2)
-        self.type = match.group(3)
+        self.group = match[2]
+        self.type = match[3]
 
     def metadata(self):
         return {"group": self.group, "type": self.type}
 
     def paintings(self):
-        url = "{}/{}/paintings-by-{}/{}".format(
-            self.root, self.lang, self.group, self.type)
+        url = f"{self.root}/{self.lang}/paintings-by-{self.group}/{self.type}"
         return self._pagination(url)
 
 
@@ -147,19 +129,15 @@ class WikiartArtistsExtractor(WikiartExtractor):
     """Extractor for artist collections on wikiart.org"""
     subcategory = "artists"
     pattern = (BASE_PATTERN + r"/artists-by-([\w-]+)/([\w-]+)")
-    test = ("https://www.wikiart.org/en/artists-by-century/12", {
-        "pattern": WikiartArtistExtractor.pattern,
-        "count": ">= 8",
-    })
+    example = "https://www.wikiart.org/en/artists-by-GROUP/TYPE"
 
     def __init__(self, match):
         WikiartExtractor.__init__(self, match)
-        self.group = match.group(2)
-        self.type = match.group(3)
+        self.group = match[2]
+        self.type = match[3]
 
     def items(self):
-        url = "{}/{}/App/Search/Artists-by-{}".format(
-            self.root, self.lang, self.group)
+        url = f"{self.root}/{self.lang}/App/Search/Artists-by-{self.group}"
         params = {"json": "3", "searchterm": self.type}
 
         for artist in self._pagination(url, params, "Artists"):

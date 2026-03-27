@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2020-2021 Mike Fährmann
+# Copyright 2020-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -10,7 +10,6 @@
 
 from .common import GalleryExtractor, Extractor, Message
 from .. import text, util
-import json
 
 
 class HentaihandGalleryExtractor(GalleryExtractor):
@@ -18,35 +17,15 @@ class HentaihandGalleryExtractor(GalleryExtractor):
     category = "hentaihand"
     root = "https://hentaihand.com"
     pattern = r"(?:https?://)?(?:www\.)?hentaihand\.com/\w+/comic/([\w-]+)"
-    test = (
-        (("https://hentaihand.com/en/comic/c75-takumi-na-muchi-choudenji-hou-"
-          "no-aishi-kata-how-to-love-a-super-electromagnetic-gun-toaru-kagaku-"
-          "no-railgun-english"), {
-            "pattern": r"https://cdn.hentaihand.com/.*/images/360468/\d+.jpg$",
-            "count": 50,
-            "keyword": {
-                "artists"   : ["Takumi Na Muchi"],
-                "date"      : "dt:2014-06-28 00:00:00",
-                "gallery_id": 360468,
-                "lang"      : "en",
-                "language"  : "English",
-                "parodies"  : ["Toaru Kagaku No Railgun"],
-                "relationships": list,
-                "tags"      : list,
-                "title"     : r"re:\(C75\) \[Takumi na Muchi\] Choudenji Hou ",
-                "title_alt" : r"re:\(C75\) \[たくみなむち\] 超電磁砲のあいしかた",
-                "type"      : "Doujinshi",
-            },
-        }),
-    )
+    example = "https://hentaihand.com/en/comic/TITLE"
 
     def __init__(self, match):
-        self.slug = match.group(1)
-        url = "{}/api/comics/{}".format(self.root, self.slug)
+        self.slug = match[1]
+        url = f"{self.root}/api/comics/{self.slug}"
         GalleryExtractor.__init__(self, match, url)
 
     def metadata(self, page):
-        info = json.loads(page)
+        info = util.json_loads(page)
         data = {
             "gallery_id" : text.parse_int(info["id"]),
             "title"      : info["title"],
@@ -56,8 +35,7 @@ class HentaihandGalleryExtractor(GalleryExtractor):
             "language"   : info["language"]["name"],
             "lang"       : util.language_to_code(info["language"]["name"]),
             "tags"       : [t["slug"] for t in info["tags"]],
-            "date"       : text.parse_datetime(
-                info["uploaded_at"], "%Y-%m-%d"),
+            "date"       : self.parse_datetime_iso(info["uploaded_at"]),
         }
         for key in ("artists", "authors", "groups", "characters",
                     "relationships", "parodies"):
@@ -65,7 +43,7 @@ class HentaihandGalleryExtractor(GalleryExtractor):
         return data
 
     def images(self, _):
-        info = self.request(self.gallery_url + "/images").json()
+        info = self.request_json(self.page_url + "/images")
         return [(img["source_url"], img) for img in info["images"]]
 
 
@@ -77,15 +55,7 @@ class HentaihandTagExtractor(Extractor):
     pattern = (r"(?i)(?:https?://)?(?:www\.)?hentaihand\.com"
                r"/\w+/(parody|character|tag|artist|group|language"
                r"|category|relationship)/([^/?#]+)")
-    test = (
-        ("https://hentaihand.com/en/artist/takumi-na-muchi", {
-            "pattern": HentaihandGalleryExtractor.pattern,
-            "count": ">= 6",
-        }),
-        ("https://hentaihand.com/en/tag/full-color"),
-        ("https://hentaihand.com/fr/language/japanese"),
-        ("https://hentaihand.com/zh/category/manga"),
-    )
+    example = "https://hentaihand.com/en/tag/TAG"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
@@ -97,8 +67,8 @@ class HentaihandTagExtractor(Extractor):
         else:
             tpl = self.type + "s"
 
-        url = "{}/api/{}/{}".format(self.root, tpl, self.key)
-        tid = self.request(url, notfound=self.type).json()["id"]
+        url = f"{self.root}/api/{tpl}/{self.key}"
+        tid = self.request_json(url, notfound=self.type)["id"]
 
         url = self.root + "/api/comics"
         params = {
@@ -111,10 +81,10 @@ class HentaihandTagExtractor(Extractor):
             "duration": "day",
         }
         while True:
-            info = self.request(url, params=params).json()
+            info = self.request_json(url, params=params)
 
             for gallery in info["data"]:
-                gurl = "{}/en/comic/{}".format(self.root, gallery["slug"])
+                gurl = f"{self.root}/en/comic/{gallery['slug']}"
                 gallery["_extractor"] = HentaihandGalleryExtractor
                 yield Message.Queue, gurl, gallery
 

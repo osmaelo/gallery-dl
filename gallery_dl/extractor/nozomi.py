@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2021 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,7 +9,7 @@
 """Extractors for https://nozomi.la/"""
 
 from .common import Extractor, Message
-from .. import text
+from .. import text, dt
 
 
 def decode_nozomi(n):
@@ -21,18 +21,19 @@ class NozomiExtractor(Extractor):
     """Base class for nozomi extractors"""
     category = "nozomi"
     root = "https://nozomi.la"
+    domain = "gold-usergeneratedcontent.net"
     filename_fmt = "{postid} {dataid}.{extension}"
     archive_fmt = "{dataid}"
 
-    def items(self):
-
-        data = self.metadata()
+    def _init(self):
         self.session.headers["Origin"] = self.root
-        self.session.headers["Referer"] = self.root + "/"
+
+    def items(self):
+        data = self.metadata()
 
         for post_id in map(str, self.posts()):
-            url = "https://j.nozomi.la/post/{}/{}/{}.json".format(
-                post_id[-1], post_id[-3:-1], post_id)
+            url = (f"https://j.{self.domain}/post"
+                   f"/{post_id[-1]}/{post_id[-3:-1]}/{post_id}.json")
             response = self.request(url, fatal=False)
 
             if response.status_code >= 400:
@@ -48,10 +49,9 @@ class NozomiExtractor(Extractor):
             post["character"] = self._list(post.get("character"))
 
             try:
-                post["date"] = text.parse_datetime(
-                    post["date"] + ":00", "%Y-%m-%d %H:%M:%S%z")
+                post["date"] = dt.parse_iso(post["date"] + ":00")
             except Exception:
-                post["date"] = None
+                post["date"] = dt.NONE
 
             post.update(data)
 
@@ -60,12 +60,24 @@ class NozomiExtractor(Extractor):
                 if key in post:
                     del post[key]
 
-            yield Message.Directory, post
+            yield Message.Directory, "", post
             for post["num"], image in enumerate(images, 1):
-                post["url"] = url = text.urljoin(self.root, image["imageurl"])
-                text.nameext_from_url(url, post)
-                post["is_video"] = bool(image.get("is_video"))
-                post["dataid"] = post["filename"]
+                post["filename"] = post["dataid"] = did = image["dataid"]
+                post["is_video"] = video = \
+                    True if image.get("is_video") else False
+
+                ext = image["type"]
+                if video:
+                    subdomain = "v"
+                elif ext == "gif":
+                    subdomain = "g"
+                else:
+                    subdomain = "w"
+                    ext = "webp"
+
+                post["extension"] = ext
+                post["url"] = url = (f"https://{subdomain}.{self.domain}"
+                                     f"/{did[-1]}/{did[-3:-1]}/{did}.{ext}")
                 yield Message.Url, url, post
 
     def posts(self):
@@ -73,7 +85,7 @@ class NozomiExtractor(Extractor):
         offset = (text.parse_int(self.pnum, 1) - 1) * 256
 
         while True:
-            headers = {"Range": "bytes={}-{}".format(offset, offset+255)}
+            headers = {"Range": f"bytes={offset}-{offset + 255}"}
             response = self.request(url, headers=headers)
             yield from decode_nozomi(response.content)
 
@@ -85,8 +97,7 @@ class NozomiExtractor(Extractor):
     def metadata(self):
         return {}
 
-    @staticmethod
-    def _list(src):
+    def _list(self, src):
         return [x["tagname_display"] for x in src] if src else ()
 
 
@@ -94,43 +105,11 @@ class NozomiPostExtractor(NozomiExtractor):
     """Extractor for individual posts on nozomi.la"""
     subcategory = "post"
     pattern = r"(?:https?://)?nozomi\.la/post/(\d+)"
-    test = (
-        ("https://nozomi.la/post/3649262.html", {
-            "url": "f4522adfc8159355fd0476de28761b5be0f02068",
-            "content": "cd20d2c5149871a0b80a1b0ce356526278964999",
-            "keyword": {
-                "artist"   : ["hammer (sunset beach)"],
-                "character": ["patchouli knowledge"],
-                "copyright": ["touhou"],
-                "dataid"   : "re:aaa9f7c632cde1e1a5baaff3fb6a6d857ec73df7fdc5",
-                "date"     : "dt:2016-07-26 02:32:03",
-                "extension": "jpg",
-                "filename" : str,
-                "height"   : 768,
-                "is_video" : False,
-                "postid"   : 3649262,
-                "source"   : "danbooru",
-                "tags"     : list,
-                "type"     : "jpg",
-                "url"      : str,
-                "width"    : 1024,
-            },
-        }),
-        #  multiple images per post
-        ("https://nozomi.la/post/25588032.html", {
-            "url": "6aa3b7db385abcc9d374bdffd19187bccbf8f228",
-            "keyword": "f60e048df36308b6b25dfaac419b586895d360bc",
-            "count": 7,
-        }),
-        # empty 'date' (#1163)
-        ("https://nozomi.la/post/130309.html", {
-            "keyword": {"date": None},
-        })
-    )
+    example = "https://nozomi.la/post/12345.html"
 
     def __init__(self, match):
         NozomiExtractor.__init__(self, match)
-        self.post_id = match.group(1)
+        self.post_id = match[1]
 
     def posts(self):
         return (self.post_id,)
@@ -141,16 +120,12 @@ class NozomiIndexExtractor(NozomiExtractor):
     subcategory = "index"
     pattern = (r"(?:https?://)?nozomi\.la/"
                r"(?:(index(?:-Popular)?)-(\d+)\.html)?(?:$|#|\?)")
-    test = (
-        ("https://nozomi.la/"),
-        ("https://nozomi.la/index-2.html"),
-        ("https://nozomi.la/index-Popular-33.html"),
-    )
+    example = "https://nozomi.la/index-1.html"
 
     def __init__(self, match):
         NozomiExtractor.__init__(self, match)
         index, self.pnum = match.groups()
-        self.nozomi = "/{}.nozomi".format(index or "index")
+        self.nozomi = f"/{index or 'index'}.nozomi"
 
 
 class NozomiTagExtractor(NozomiExtractor):
@@ -159,17 +134,13 @@ class NozomiTagExtractor(NozomiExtractor):
     directory_fmt = ("{category}", "{search_tags}")
     archive_fmt = "t_{search_tags}_{dataid}"
     pattern = r"(?:https?://)?nozomi\.la/tag/([^/?#]+)-(\d+)\."
-    test = ("https://nozomi.la/tag/3:1_aspect_ratio-1.html", {
-        "pattern": r"^https://i.nozomi.la/\w/\w\w/\w+\.\w+$",
-        "count": ">= 25",
-        "range": "1-25",
-    })
+    example = "https://nozomi.la/tag/TAG-1.html"
 
     def __init__(self, match):
         NozomiExtractor.__init__(self, match)
         tags, self.pnum = match.groups()
         self.tags = text.unquote(tags)
-        self.nozomi = "/nozomi/{}.nozomi".format(self.tags)
+        self.nozomi = f"/nozomi/{self.tags}.nozomi"
 
     def metadata(self):
         return {"search_tags": self.tags}
@@ -181,36 +152,38 @@ class NozomiSearchExtractor(NozomiExtractor):
     directory_fmt = ("{category}", "{search_tags:J }")
     archive_fmt = "t_{search_tags}_{dataid}"
     pattern = r"(?:https?://)?nozomi\.la/search\.html\?q=([^&#]+)"
-    test = ("https://nozomi.la/search.html?q=hibiscus%203:4_ratio#1", {
-        "count": ">= 5",
-    })
+    example = "https://nozomi.la/search.html?q=QUERY"
 
     def __init__(self, match):
         NozomiExtractor.__init__(self, match)
-        self.tags = text.unquote(match.group(1)).split()
+        self.tags = text.unquote(match[1]).split()
 
     def metadata(self):
         return {"search_tags": self.tags}
 
     def posts(self):
-        index = None
-        result = set()
+        result = None
+        positive = []
+        negative = []
 
         def nozomi(path):
-            url = "https://j.nozomi.la/" + path + ".nozomi"
+            url = f"https://j.{self.domain}/{path}.nozomi"
             return decode_nozomi(self.request(url).content)
 
         for tag in self.tags:
-            if tag[0] == "-":
-                if not index:
-                    index = set(nozomi("index"))
-                items = index.difference(nozomi("nozomi/" + tag[1:]))
-            else:
-                items = nozomi("nozomi/" + tag)
+            (negative if tag[0] == "-" else positive).append(
+                text.quote(tag.replace("/", "")))
 
-            if result:
-                result.intersection_update(items)
+        for tag in positive:
+            ids = nozomi("nozomi/" + tag)
+            if result is None:
+                result = set(ids)
             else:
-                result.update(items)
+                result.intersection_update(ids)
 
-        return sorted(result, reverse=True)
+        if result is None:
+            result = set(nozomi("index"))
+        for tag in negative:
+            result.difference_update(nozomi("nozomi/" + tag[1:]))
+
+        return sorted(result, reverse=True) if result else ()

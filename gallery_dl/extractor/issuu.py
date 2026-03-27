@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2019-2020 Mike Fährmann
+# Copyright 2019-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -10,7 +10,6 @@
 
 from .common import GalleryExtractor, Extractor, Message
 from .. import text, util
-import json
 
 
 class IssuuBase():
@@ -22,87 +21,61 @@ class IssuuBase():
 class IssuuPublicationExtractor(IssuuBase, GalleryExtractor):
     """Extractor for a single publication"""
     subcategory = "publication"
-    directory_fmt = ("{category}", "{document[userName]}",
-                     "{document[originalPublishDate]} {document[title]}")
+    directory_fmt = ("{category}", "{document[username]}",
+                     "{document[date]:%Y-%m-%d} {document[title]}")
     filename_fmt = "{num:>03}.{extension}"
-    archive_fmt = "{document[id]}_{num}"
+    archive_fmt = "{document[publicationId]}_{num}"
     pattern = r"(?:https?://)?issuu\.com(/[^/?#]+/docs/[^/?#]+)"
-    test = ("https://issuu.com/issuu/docs/motions-1-2019/", {
-        "pattern": r"https://image.isu.pub/190916155301-\w+/jpg/page_\d+.jpg",
-        "count"  : 36,
-        "keyword": {
-            "document": {
-                "access"        : "public",
-                "articleStories": list,
-                "contentRating" : dict,
-                "date"          : "dt:2019-09-16 00:00:00",
-                "description"   : "re:Motions, the brand new publication by I",
-                "documentId"    : r"re:\d+-d99ec95935f15091b040cb8060f05510",
-                "documentName"  : "motions-1-2019",
-                "downloadState" : "NOT_AVAILABLE",
-                "id"            : r"re:\d+-d99ec95935f15091b040cb8060f05510",
-                "isConverting"  : False,
-                "isQuarantined" : False,
-                "lang"          : "en",
-                "language"      : "English",
-                "pageCount"     : 36,
-                "publicationId" : "d99ec95935f15091b040cb8060f05510",
-                "title"         : "Motions by Issuu - Issue 1",
-                "userName"      : "issuu",
-            },
-            "extension": "jpg",
-            "filename" : r"re:page_\d+",
-            "num"      : int,
-        },
-    })
+    example = "https://issuu.com/issuu/docs/TITLE/"
 
     def metadata(self, page):
-        data = json.loads(text.extract(
-            page, 'window.__INITIAL_STATE__ =', ';\n')[0])
 
-        doc = data["document"]
-        doc["lang"] = doc["language"]
-        doc["language"] = util.code_to_language(doc["language"])
-        doc["date"] = text.parse_datetime(
-            doc["originalPublishDate"], "%Y-%m-%d")
+        data = text.extr(
+            page, '{\\"documentTextVersion\\":', ']\\n"])</script>')
+        data = util.json_loads(text.unescape(
+            '{"":' + data.replace('\\"', '"')))
 
-        self._cnt = text.parse_int(doc["pageCount"])
-        self._tpl = "https://{}/{}/jpg/page_{{}}.jpg".format(
-            data["config"]["hosts"]["image"], doc["id"])
+        doc = data["initialDocumentData"]["document"]
+        doc["date"] = self.parse_datetime_iso(
+            doc["originalPublishDateInISOString"])
+
+        self.count = text.parse_int(doc["pageCount"])
+        self.base = (f"https://image.isu.pub/{doc['revisionId']}-"
+                     f"{doc['publicationId']}/jpg/page_")
 
         return {"document": doc}
 
     def images(self, page):
-        fmt = self._tpl.format
-        return [(fmt(i), None) for i in range(1, self._cnt + 1)]
+        return [(f"{self.base}{i}.jpg", None)
+                for i in range(1, self.count + 1)]
 
 
 class IssuuUserExtractor(IssuuBase, Extractor):
     """Extractor for all publications of a user/publisher"""
     subcategory = "user"
-    pattern = r"(?:https?://)?issuu\.com/([^/?#]+)/?$"
-    test = ("https://issuu.com/issuu", {
-        "pattern": IssuuPublicationExtractor.pattern,
-        "count"  : "> 25",
-    })
-
-    def __init__(self, match):
-        Extractor.__init__(self, match)
-        self.user = match.group(1)
+    pattern = r"(?:https?://)?issuu\.com/([^/?#]+)(?:/(\d*))?$"
+    example = "https://issuu.com/USER"
 
     def items(self):
-        url = "{}/call/profile/v1/documents/{}".format(self.root, self.user)
-        params = {"offset": 0, "limit": "25"}
+        user, pnum = self.groups
+        base = self.root + "/" + user
+        pnum = text.parse_int(pnum, 1)
 
         while True:
-            data = self.request(url, params=params).json()
-
-            for publication in data["items"]:
-                publication["url"] = "{}/{}/docs/{}".format(
-                    self.root, self.user, publication["uri"])
-                publication["_extractor"] = IssuuPublicationExtractor
-                yield Message.Queue, publication["url"], publication
-
-            if not data["hasMore"]:
+            url = base + "/" + str(pnum) if pnum > 1 else base
+            try:
+                html = self.request(url).text
+                data = text.extr(html, '\\"docs\\":', '}]\\n"]')
+                docs = util.json_loads(data.replace('\\"', '"'))
+            except Exception as exc:
+                self.log.traceback(exc)
                 return
-            params["offset"] += data["limit"]
+
+            for publication in docs:
+                url = self.root + "/" + publication["uri"]
+                publication["_extractor"] = IssuuPublicationExtractor
+                yield Message.Queue, url, publication
+
+            if len(docs) < 48:
+                return
+            pnum += 1

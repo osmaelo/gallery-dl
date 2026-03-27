@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2020 Mike Fährmann
+# Copyright 2018-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -14,15 +14,32 @@ from unittest.mock import patch
 
 import time
 import string
-from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gallery_dl import extractor  # noqa E402
+from gallery_dl import extractor, util, dt, config, cache  # noqa E402
 from gallery_dl.extractor import mastodon  # noqa E402
 from gallery_dl.extractor.common import Extractor, Message  # noqa E402
 from gallery_dl.extractor.directlink import DirectlinkExtractor  # noqa E402
 
 _list_classes = extractor._list_classes
+
+try:
+    RESULTS = os.environ.get("GDL_TEST_RESULTS")
+    if RESULTS:
+        results = util.import_file(RESULTS)
+    else:
+        from test import results
+except ImportError:
+    results = None
+
+
+def setUpModule():
+    if cache.DATABASE is None:
+        import atexit
+        import tempfile
+        dbpath = tempfile.mkstemp()[1]
+        config.set(("cache",), "file", dbpath)
+        atexit.register(util.remove_file, dbpath)
 
 
 class FakeExtractor(Extractor):
@@ -31,7 +48,7 @@ class FakeExtractor(Extractor):
     pattern = "fake:"
 
     def items(self):
-        yield Message.Version, 1
+        yield Message.Noop
         yield Message.Url, "text:foobar", {}
 
 
@@ -40,13 +57,13 @@ class TestExtractorModule(unittest.TestCase):
         "https://example.org/file.jpg",
         "tumblr:foobar",
         "oauth:flickr",
-        "test:pixiv:",
+        "generic:https://example.org/",
         "recursive:https://example.org/document.html",
     )
 
     def setUp(self):
         extractor._cache.clear()
-        extractor._module_iter = iter(extractor.modules)
+        extractor._module_iter = extractor._modules_internal()
         extractor._list_classes = _list_classes
 
     def test_find(self):
@@ -92,51 +109,91 @@ class TestExtractorModule(unittest.TestCase):
             with self.assertRaises(TypeError):
                 FakeExtractor.from_url(invalid)
 
-    def test_unique_pattern_matches(self):
-        test_urls = []
+    @unittest.skipIf(not results, "no test data")
+    def test_categories(self):
+        for result in results.all():
+            if result.get("#fail"):
+                try:
+                    self.assertCategories(result)
+                except AssertionError:
+                    pass
+                else:
+                    self.fail(f"{result['#url']}: Test did not fail")
+            else:
+                self.assertCategories(result)
 
-        # collect testcase URLs
-        for extr in extractor.extractors():
-            for testcase in extr._get_tests():
-                test_urls.append((testcase[0], extr))
+    def assertCategories(self, result):
+        url = result["#url"]
+        cls = result["#class"]
 
-        # iterate over all testcase URLs
-        for url, extr1 in test_urls:
-            matches = []
+        try:
+            extr = cls.from_url(url)
+            find = extractor.find(url)
+        except ImportError as exc:
+            if exc.name in ("youtube_dl", "yt_dlp"):
+                return sys.stdout.write(
+                    f"Skipping '{cls.category}' category checks\n")
+            raise
+        self.assertTrue(extr, url)
+        self.assertIs(extr.__class__, find.__class__, url)
 
-            # ... and apply all regex patterns to each one
-            for extr2 in extractor._cache:
+        categories = result.get("#category")
+        if categories:
+            base, cat, sub = categories
+        else:
+            cat = cls.category
+            sub = cls.subcategory
+            base = cls.basecategory
+        self.assertEqual(extr.category, cat, url)
+        self.assertEqual(extr.subcategory, sub, url)
+        self.assertEqual(extr.basecategory, base, url)
 
-                # skip DirectlinkExtractor pattern if it isn't tested
-                if extr1 != DirectlinkExtractor and \
-                        extr2 == DirectlinkExtractor:
+        if base not in ("reactor", "wikimedia"):
+            self.assertEqual(extr._cfgpath, ("extractor", cat, sub), url)
+
+    def test_init(self):
+        """Test for exceptions in Extractor.initialize() and .finalize()"""
+        def fail_request(*args, **kwargs):
+            self.fail("called 'request() during initialization")
+
+        for cls in extractor.extractors():
+            if cls.category == "ytdl":
+                continue
+            extr = cls.from_url(cls.example)
+            if not extr:
+                if cls.basecategory and not cls.instances:
                     continue
+                self.fail(f"{cls.__name__} pattern does not match "
+                          f"example URL '{cls.example}'")
 
-                match = extr2.pattern.match(url)
-                if match:
-                    matches.append(match)
+            self.assertEqual(cls, extr.__class__)
+            self.assertEqual(cls, extractor.find(cls.example).__class__)
 
-            # fail if more or less than 1 match happened
-            if len(matches) > 1:
-                msg = "'{}' gets matched by more than one pattern:".format(url)
-                for match in matches:
-                    msg += "\n- "
-                    msg += match.re.pattern
-                self.fail(msg)
+            extr.request = fail_request
+            extr.initialize()
+            if extr.finalize is not None:
+                extr.finalize(0)
 
-            if len(matches) < 1:
-                msg = "'{}' isn't matched by any pattern".format(url)
-                self.fail(msg)
+    def test_init_ytdl(self):
+        try:
+            extr = extractor.find("ytdl:")
+            extr.initialize()
+            if extr.finalize is not None:
+                extr.finalize(0)
+        except ImportError as exc:
+            if exc.name in ("youtube_dl", "yt_dlp"):
+                raise unittest.SkipTest(f"cannot import module '{exc.name}'")
+            raise
 
     def test_docstrings(self):
-        """ensure docstring uniqueness"""
+        """Ensure docstring uniqueness"""
         for extr1 in extractor.extractors():
             for extr2 in extractor.extractors():
                 if extr1 != extr2 and extr1.__doc__ and extr2.__doc__:
                     self.assertNotEqual(
                         extr1.__doc__,
                         extr2.__doc__,
-                        "{} <-> {}".format(extr1, extr2),
+                        f"{extr1} <-> {extr2}",
                     )
 
     def test_names(self):
@@ -148,19 +205,17 @@ class TestExtractorModule(unittest.TestCase):
 
         for extr in extractor.extractors():
             if extr.category not in ("", "oauth", "ytdl"):
-                expected = "{}{}Extractor".format(
-                    capitalize(extr.category),
-                    capitalize(extr.subcategory),
-                )
+                expected = (f"{capitalize(extr.category)}"
+                            f"{capitalize(extr.subcategory)}Extractor")
                 if expected[0].isdigit():
-                    expected = "_" + expected
+                    expected = f"_{expected}"
                 self.assertEqual(expected, extr.__name__)
 
 
 class TestExtractorWait(unittest.TestCase):
 
     def test_wait_seconds(self):
-        extr = extractor.find("test:")
+        extr = extractor.find("generic:https://example.org/")
         seconds = 5
         until = time.time() + seconds
 
@@ -171,10 +226,26 @@ class TestExtractorWait(unittest.TestCase):
 
             calls = log.info.mock_calls
             self.assertEqual(len(calls), 1)
-            self._assert_isotime(calls[0][1][1], until)
+            self.assertEqual(calls[0][1][1], "6 seconds")
+            self._assert_isotime(calls[0][1][2], until)
+
+    def test_wait_seconds_long(self):
+        extr = extractor.find("generic:https://example.org/")
+        seconds = 5000
+        until = time.time() + seconds
+
+        with patch("time.sleep") as sleep, patch.object(extr, "log") as log:
+            extr.wait(seconds=seconds)
+
+            sleep.assert_called_once_with(5001.0)
+
+            calls = log.info.mock_calls
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1][1], "1h 23min")
+            self._assert_isotime(calls[0][1][2], until)
 
     def test_wait_until(self):
-        extr = extractor.find("test:")
+        extr = extractor.find("generic:https://example.org/")
         until = time.time() + 5
 
         with patch("time.sleep") as sleep, patch.object(extr, "log") as log:
@@ -182,16 +253,20 @@ class TestExtractorWait(unittest.TestCase):
 
             calls = sleep.mock_calls
             self.assertEqual(len(calls), 1)
-            self.assertAlmostEqual(calls[0][1][0], 6.0, places=1)
+            self.assertAlmostEqual(calls[0][1][0], 6.0, places=0)
 
             calls = log.info.mock_calls
             self.assertEqual(len(calls), 1)
-            self._assert_isotime(calls[0][1][1], until)
+            self.assertEqual(calls[0][1][1], "5 seconds")
+            self._assert_isotime(calls[0][1][2], until)
 
     def test_wait_until_datetime(self):
-        extr = extractor.find("test:")
-        until = datetime.utcnow() + timedelta(seconds=5)
-        until_local = datetime.now() + timedelta(seconds=5)
+        extr = extractor.find("generic:https://example.org/")
+        until = dt.now() + dt.timedelta(seconds=5)
+        until_local = dt.datetime.now() + dt.timedelta(seconds=5)
+
+        if not until.microsecond:
+            until = until.replace(microsecond=until_local.microsecond)
 
         with patch("time.sleep") as sleep, patch.object(extr, "log") as log:
             extr.wait(until=until)
@@ -202,26 +277,97 @@ class TestExtractorWait(unittest.TestCase):
 
             calls = log.info.mock_calls
             self.assertEqual(len(calls), 1)
-            self._assert_isotime(calls[0][1][1], until_local)
+            self.assertEqual(calls[0][1][1], "5 seconds")
+            self._assert_isotime(calls[0][1][2], until_local)
 
     def _assert_isotime(self, output, until):
-        if not isinstance(until, datetime):
-            until = datetime.fromtimestamp(until)
+        if not isinstance(until, dt.datetime):
+            until = dt.datetime.fromtimestamp(until)
         o = self._isotime_to_seconds(output)
         u = self._isotime_to_seconds(until.time().isoformat()[:8])
-        self.assertLess(o-u, 1.0)
+        self.assertLessEqual(o-u, 1.0)
 
-    @staticmethod
-    def _isotime_to_seconds(isotime):
+    def _isotime_to_seconds(self, isotime):
         parts = isotime.split(":")
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+
+class TextExtractorCommonDateminmax(unittest.TestCase):
+
+    def setUp(self):
+        config.clear()
+
+    tearDown = setUp
+
+    def test_date_min_max_default(self):
+        extr = extractor.find("generic:https://example.org/")
+
+        dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, None)
+        self.assertEqual(dmax, None)
+
+        dmin, dmax = extr._get_date_min_max(..., -1)
+        self.assertEqual(dmin, ...)
+        self.assertEqual(dmax, -1)
+
+    def test_date_min_max_timestamp(self):
+        extr = extractor.find("generic:https://example.org/")
+        config.set((), "date-min", 1262304000)
+        config.set((), "date-max", 1262304000.123)
+
+        dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, 1262304000)
+        self.assertEqual(dmax, 1262304000.123)
+
+    def test_date_min_max_iso(self):
+        extr = extractor.find("generic:https://example.org/")
+        config.set((), "date-min", "2010-01-01")
+        config.set((), "date-max", "2010-01-01T00:01:03")
+
+        dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, 1262304000)
+        self.assertEqual(dmax, 1262304063)
+
+    def test_date_min_max_iso_invalid(self):
+        extr = extractor.find("generic:https://example.org/")
+        config.set((), "date-min", "2010-01-01")
+        config.set((), "date-max", "2010-01")
+
+        with self.assertLogs() as log_info:
+            dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, 1262304000)
+        self.assertEqual(dmax, None)
+
+        self.assertEqual(len(log_info.output), 1)
+        self.assertEqual(
+            log_info.output[0],
+            "WARNING:generic:Unable to parse 'date-max': "
+            "Invalid ISO 8601 date/time value '2010-01'")
+
+    def test_date_min_max(self):
+        extr = extractor.find("generic:https://example.org/")
+        config.set((), "date-min", "2010-01-01")
+        config.set((), "date-max", "2022-08-18")
+
+        dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, 1262304000)
+        self.assertEqual(dmax, 1660780800)
+
+    def test_date_min_max_mix(self):
+        extr = extractor.find("generic:https://example.org/")
+        config.set((), "date-min", "2010-01-01")
+        config.set((), "date-max", 1262304061)
+
+        dmin, dmax = extr._get_date_min_max()
+        self.assertEqual(dmin, 1262304000)
+        self.assertEqual(dmax, 1262304061)
 
 
 class TextExtractorOAuth(unittest.TestCase):
 
     def test_oauth1(self):
         for category in ("flickr", "smugmug", "tumblr"):
-            extr = extractor.find("oauth:" + category)
+            extr = extractor.find(f"oauth:{category}")
 
             with patch.object(extr, "_oauth1_authorization_flow") as m:
                 for msg in extr:
@@ -230,7 +376,7 @@ class TextExtractorOAuth(unittest.TestCase):
 
     def test_oauth2(self):
         for category in ("deviantart", "reddit"):
-            extr = extractor.find("oauth:" + category)
+            extr = extractor.find(f"oauth:{category}")
 
             with patch.object(extr, "_oauth2_authorization_code_grant") as m:
                 for msg in extr:
@@ -252,11 +398,13 @@ class TextExtractorOAuth(unittest.TestCase):
 
         with patch.object(extr, "_oauth2_authorization_code_grant") as m, \
                 patch.object(extr, "_register") as r:
+            r.__name__ = "_register"
             r.return_value = {
                 "client-id"    : "foo",
                 "client-secret": "bar",
             }
 
+            extr.cache_update(r, "example.com", None)
             for msg in extr:
                 pass
 

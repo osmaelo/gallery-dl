@@ -18,80 +18,74 @@ class TumblrgalleryExtractor(GalleryExtractor):
     filename_fmt = "{category}_{gallery_id}_{num:>03}_{id}.{extension}"
     directory_fmt = ("{category}", "{gallery_id} {title}")
     root = "https://tumblrgallery.xyz"
+    referer = False
+
+    def _urls_from_page(self, page):
+        return text.extract_iter(
+            page, '<div class="report"> <a class="xx-co-me" href="', '"')
+
+    def _data_from_url(self, url):
+        filename = text.nameext_from_url(url)["filename"]
+        parts = filename.split("_")
+        try:
+            return {"id": parts[1] if parts[1] != "inline" else parts[2]}
+        except IndexError:
+            return {"id": filename}
 
 
 class TumblrgalleryTumblrblogExtractor(TumblrgalleryExtractor):
     """Extractor for Tumblrblog on tumblrgallery.xyz"""
     subcategory = "tumblrblog"
     pattern = BASE_PATTERN + r"(/tumblrblog/gallery/(\d+)\.html)"
-    test = ("https://tumblrgallery.xyz/tumblrblog/gallery/103975.html",)
+    example = "https://tumblrgallery.xyz/tumblrblog/gallery/12345.html"
 
     def __init__(self, match):
         TumblrgalleryExtractor.__init__(self, match)
-        self.gallery_id = text.parse_int(match.group(2))
+        self.gallery_id = text.parse_int(match[2])
 
     def metadata(self, page):
         return {
-            "title" : text.unescape(text.extract(page, "<h1>", "</h1>"))[0],
+            "title" : text.unescape(text.extr(page, "<h1>", "</h1>")),
             "gallery_id": self.gallery_id,
         }
 
     def images(self, _):
-        page_num = 1
+        base = f"{self.root}/tumblrblog/gallery/{self.gallery_id}/"
+        pnum = 1
+
         while True:
-            response = self.request(
-                "{}/tumblrblog/gallery/{}/{}.html"
-                .format(self.root, self.gallery_id, page_num),
-                allow_redirects=False
-            )
-            if response.status_code != 200:
+            url = f"{base}{pnum}.html"
+            response = self.request(url, allow_redirects=False, fatal=False)
+
+            if response.status_code >= 300:
                 return
 
-            page = response.text
-            page_num += 1
-
-            urls = list(text.extract_iter(
-                page,
-                '<div class="report xx-co-me"> <a href="',
-                '" data-fancybox="gallery"'
-            ))
-
-            for image_src in urls:
-                yield image_src, {
-                    "id": text.extract(image_src, "tumblr_", "_")[0]
-                }
+            for url in self._urls_from_page(response.text):
+                yield url, self._data_from_url(url)
+            pnum += 1
 
 
 class TumblrgalleryPostExtractor(TumblrgalleryExtractor):
     """Extractor for Posts on tumblrgallery.xyz"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"(/post/(\d+)\.html)"
-    test = ("https://tumblrgallery.xyz/post/405674.html",)
+    example = "https://tumblrgallery.xyz/post/12345.html"
 
     def __init__(self, match):
         TumblrgalleryExtractor.__init__(self, match)
-        self.gallery_id = text.parse_int(match.group(2))
+        self.gallery_id = text.parse_int(match[2])
 
     def metadata(self, page):
         return {
             "title" : text.remove_html(
-                text.unescape(text.extract(page, "<title>", "</title>")[0])
+                text.unescape(text.extr(page, "<title>", "</title>"))
             ).replace("_", "-"),
             "gallery_id": self.gallery_id,
         }
 
     def images(self, page):
-        urls = list(text.extract_iter(
-            page,
-            '<div class="report xx-co-me"> <a href="',
-            '" data-fancybox="gallery"'
-        ))
-
-        for image_src in urls:
-            yield image_src, {
-                "id": text.extract(image_src, "tumblr_", "_")[0] or
-                text.nameext_from_url(image_src)["filename"]
-            }
+        for url in self._urls_from_page(page):
+            yield url, self._data_from_url(url)
 
 
 class TumblrgallerySearchExtractor(TumblrgalleryExtractor):
@@ -100,11 +94,11 @@ class TumblrgallerySearchExtractor(TumblrgalleryExtractor):
     filename_fmt = "{category}_{num:>03}_{gallery_id}_{id}_{title}.{extension}"
     directory_fmt = ("{category}", "{search_term}")
     pattern = BASE_PATTERN + r"(/s\.php\?q=([^&#]+))"
-    test = ("https://tumblrgallery.xyz/s.php?q=everyday-life",)
+    example = "https://tumblrgallery.xyz/s.php?q=QUERY"
 
     def __init__(self, match):
         TumblrgalleryExtractor.__init__(self, match)
-        self.search_term = match.group(2)
+        self.search_term = match[2]
 
     def metadata(self, page):
         return {
@@ -112,38 +106,26 @@ class TumblrgallerySearchExtractor(TumblrgalleryExtractor):
         }
 
     def images(self, _):
-        page_num = 1
+        page_url = "s.php?q=" + self.search_term
         while True:
-            response = self.request(
-                "{}/s.php?q={}&page={}"
-                .format(self.root, self.search_term, page_num),
-                allow_redirects=False
-            )
-            if response.status_code != 200:
+            page = self.request(self.root + "/" + page_url).text
+
+            for gallery_id in text.extract_iter(
+                    page, '<div class="title"><a href="post/', '.html'):
+
+                url = f"{self.root}/post/{gallery_id}.html"
+                post_page = self.request(url).text
+
+                for url in self._urls_from_page(post_page):
+                    data = self._data_from_url(url)
+                    data["gallery_id"] = gallery_id
+                    data["title"] = text.remove_html(text.unescape(
+                        text.extr(post_page, "<title>", "</title>")
+                    )).replace("_", "-")
+                    yield url, data
+
+            next_url = text.extr(
+                page, '</span> <a class="btn btn-primary" href="', '"')
+            if not next_url or page_url == next_url:
                 return
-
-            page = response.text
-            page_num += 1
-
-            gallery_ids = list(text.extract_iter(
-                page,
-                '<div class="title"><a href="post/',
-                '.html'
-            ))
-
-            for gallery_id in gallery_ids:
-                post_page = self.request(
-                    "{}/post/{}.html"
-                    .format(self.root, gallery_id),
-                    allow_redirects=False
-                ).text
-                for image_src in TumblrgalleryPostExtractor.images(
-                    self, post_page
-                ):
-                    image_src[1]["title"] = text.remove_html(
-                        text.unescape(
-                            text.extract(post_page, "<title>", "</title>")[0]
-                        )
-                    ).replace("_", "-")
-                    image_src[1]["gallery_id"] = gallery_id
-                    yield image_src
+            page_url = next_url

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2020 Mike Fährmann
+# Copyright 2020-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,8 +9,7 @@
 """Extractors for https://inkbunny.net/"""
 
 from .common import Extractor, Message
-from .. import text, exception
-from ..cache import cache
+from .. import text
 
 
 BASE_PATTERN = r"(?:https?://)?(?:www\.)?inkbunny\.net"
@@ -24,18 +23,19 @@ class InkbunnyExtractor(Extractor):
     archive_fmt = "{file_id}"
     root = "https://inkbunny.net"
 
-    def __init__(self, match):
-        Extractor.__init__(self, match)
+    def _init(self):
         self.api = InkbunnyAPI(self)
 
     def items(self):
         self.api.authenticate()
+        metadata = self.metadata()
         to_bool = ("deleted", "favorite", "friends_only", "guest_block",
                    "hidden", "public", "scraps")
 
         for post in self.posts():
-            post["date"] = text.parse_datetime(
-                post["create_datetime"] + "00", "%Y-%m-%d %H:%M:%S.%f%z")
+            post.update(metadata)
+            post["date"] = self.parse_datetime_iso(
+                post["create_datetime"][:19])
             post["tags"] = [kw["keyword_name"] for kw in post["keywords"]]
             post["ratings"] = [r["name"] for r in post["ratings"]]
             files = post["files"]
@@ -47,12 +47,12 @@ class InkbunnyExtractor(Extractor):
             del post["keywords"]
             del post["files"]
 
-            yield Message.Directory, post
+            yield Message.Directory, "", post
             for post["num"], file in enumerate(files, 1):
                 post.update(file)
                 post["deleted"] = (file["deleted"] == "t")
-                post["date"] = text.parse_datetime(
-                    file["create_datetime"] + "00", "%Y-%m-%d %H:%M:%S.%f%z")
+                post["date"] = self.parse_datetime_iso(
+                    file["create_datetime"][:19])
                 text.nameext_from_url(file["file_name"], post)
 
                 url = file["file_url_full"]
@@ -60,56 +60,18 @@ class InkbunnyExtractor(Extractor):
                     url += "?sid=" + self.api.session_id
                 yield Message.Url, url, post
 
+    def posts(self):
+        return ()
+
+    def metadata(self):
+        return ()
+
 
 class InkbunnyUserExtractor(InkbunnyExtractor):
     """Extractor for inkbunny user profiles"""
     subcategory = "user"
     pattern = BASE_PATTERN + r"/(?!s/)(gallery/|scraps/)?(\w+)(?:$|[/?#])"
-    test = (
-        ("https://inkbunny.net/soina", {
-            "pattern": r"https://[\w.]+\.metapix\.net/files/full"
-                       r"/\d+/\d+_soina_.+",
-            "range": "20-50",
-            "keyword": {
-                "date"         : "type:datetime",
-                "deleted"      : bool,
-                "file_id"      : "re:[0-9]+",
-                "filename"     : r"re:[0-9]+_soina_\w+",
-                "full_file_md5": "re:[0-9a-f]{32}",
-                "mimetype"     : str,
-                "submission_id": "re:[0-9]+",
-                "user_id"      : "20969",
-                "comments_count" : "re:[0-9]+",
-                "deleted"        : bool,
-                "favorite"       : bool,
-                "favorites_count": "re:[0-9]+",
-                "friends_only"   : bool,
-                "guest_block"    : bool,
-                "hidden"         : bool,
-                "pagecount"      : "re:[0-9]+",
-                "pools"          : list,
-                "pools_count"    : int,
-                "public"         : bool,
-                "rating_id"      : "re:[0-9]+",
-                "rating_name"    : str,
-                "ratings"        : list,
-                "scraps"         : bool,
-                "tags"           : list,
-                "title"          : str,
-                "type_name"      : str,
-                "username"       : "soina",
-                "views"          : str,
-            },
-        }),
-        ("https://inkbunny.net/gallery/soina", {
-            "range": "1-25",
-            "keyword": {"scraps": False},
-        }),
-        ("https://inkbunny.net/scraps/soina", {
-            "range": "1-25",
-            "keyword": {"scraps": True},
-        }),
-    )
+    example = "https://inkbunny.net/USER"
 
     def __init__(self, match):
         kind, self.user = match.groups()
@@ -140,25 +102,22 @@ class InkbunnyPoolExtractor(InkbunnyExtractor):
     subcategory = "pool"
     pattern = (BASE_PATTERN + r"/(?:"
                r"poolview_process\.php\?pool_id=(\d+)|"
-               r"submissionsviewall\.php\?([^#]+&mode=pool&[^#]+))")
-    test = (
-        ("https://inkbunny.net/poolview_process.php?pool_id=28985", {
-            "count": 9,
-        }),
-        ("https://inkbunny.net/submissionsviewall.php?rid=ffffffffff"
-         "&mode=pool&pool_id=28985&page=1&orderby=pool_order&random=no"),
-    )
+               r"submissionsviewall\.php"
+               r"\?((?:[^#]+&)?mode=pool(?:&[^#]+)?))")
+    example = "https://inkbunny.net/poolview_process.php?pool_id=12345"
 
     def __init__(self, match):
         InkbunnyExtractor.__init__(self, match)
-        pid = match.group(1)
-        if pid:
+        if pid := match[1]:
             self.pool_id = pid
             self.orderby = "pool_order"
         else:
-            params = text.parse_query(match.group(2))
+            params = text.parse_query(match[2])
             self.pool_id = params.get("pool_id")
             self.orderby = params.get("orderby", "pool_order")
+
+    def metadata(self):
+        return {"pool_id": self.pool_id}
 
     def posts(self):
         params = {
@@ -171,29 +130,36 @@ class InkbunnyPoolExtractor(InkbunnyExtractor):
 class InkbunnyFavoriteExtractor(InkbunnyExtractor):
     """Extractor for inkbunny user favorites"""
     subcategory = "favorite"
+    directory_fmt = ("{category}", "{favs_username!l}", "Favorites")
     pattern = (BASE_PATTERN + r"/(?:"
                r"userfavorites_process\.php\?favs_user_id=(\d+)|"
-               r"submissionsviewall\.php\?([^#]+&mode=userfavs&[^#]+))")
-    test = (
-        ("https://inkbunny.net/userfavorites_process.php?favs_user_id=20969", {
-            "pattern": r"https://[\w.]+\.metapix\.net/files/full"
-                       r"/\d+/\d+_\w+_.+",
-            "range": "20-50",
-        }),
-        ("https://inkbunny.net/submissionsviewall.php?rid=ffffffffff"
-         "&mode=userfavs&random=no&orderby=fav_datetime&page=1&user_id=20969"),
-    )
+               r"submissionsviewall\.php"
+               r"\?((?:[^#]+&)?mode=userfavs(?:&[^#]+)?))")
+    example = ("https://inkbunny.net/userfavorites_process.php"
+               "?favs_user_id=12345")
 
     def __init__(self, match):
         InkbunnyExtractor.__init__(self, match)
-        uid = match.group(1)
-        if uid:
+        if uid := match[1]:
             self.user_id = uid
             self.orderby = self.config("orderby", "fav_datetime")
         else:
-            params = text.parse_query(match.group(2))
+            params = text.parse_query(match[2])
             self.user_id = params.get("user_id")
             self.orderby = params.get("orderby", "fav_datetime")
+
+    def metadata(self):
+        # Lookup fav user ID as username
+        url = (f"{self.root}/userfavorites_process.php"
+               f"?favs_user_id={self.user_id}")
+        page = self.request(url).text
+        user_link = text.extr(page, '<a rel="author"', '</a>')
+        favs_username = text.extr(user_link, 'href="/', '"')
+
+        return {
+            "favs_user_id": self.user_id,
+            "favs_username": favs_username,
+        }
 
     def posts(self):
         params = {
@@ -205,26 +171,74 @@ class InkbunnyFavoriteExtractor(InkbunnyExtractor):
         return self.api.search(params)
 
 
+class InkbunnyUnreadExtractor(InkbunnyExtractor):
+    """Extractor for unread inkbunny submissions"""
+    subcategory = "unread"
+    pattern = (BASE_PATTERN + r"/submissionsviewall\.php"
+               r"\?((?:[^#]+&)?mode=unreadsubs(?:&[^#]+)?)")
+    example = ("https://inkbunny.net/submissionsviewall.php"
+               "?text=&mode=unreadsubs&type=")
+
+    def __init__(self, match):
+        InkbunnyExtractor.__init__(self, match)
+        self.params = text.parse_query(match[1])
+
+    def posts(self):
+        params = self.params.copy()
+        params.pop("rid", None)
+        params.pop("mode", None)
+        params["unread_submissions"] = "yes"
+        return self.api.search(params)
+
+
+class InkbunnySearchExtractor(InkbunnyExtractor):
+    """Extractor for inkbunny search results"""
+    subcategory = "search"
+    pattern = (BASE_PATTERN + r"/submissionsviewall\.php"
+               r"\?((?:[^#]+&)?mode=search(?:&[^#]+)?)")
+    example = ("https://inkbunny.net/submissionsviewall.php"
+               "?text=TAG&mode=search&type=")
+
+    def __init__(self, match):
+        InkbunnyExtractor.__init__(self, match)
+        self.params = text.parse_query(match[1])
+
+    def metadata(self):
+        return {"search": self.params}
+
+    def posts(self):
+        params = self.params.copy()
+        pop = params.pop
+
+        pop("rid", None)
+        params["string_join_type"] = pop("stringtype", None)
+        params["dayslimit"] = pop("days", None)
+        params["username"] = pop("artist", None)
+
+        if favsby := pop("favsby", None):
+            # get user_id from user profile
+            url = f"{self.root}/{favsby}"
+            page = self.request(url).text
+            user_id = text.extr(page, "?user_id=", "'")
+            params["favs_user_id"] = user_id.partition("&")[0]
+
+        return self.api.search(params)
+
+
 class InkbunnyFollowingExtractor(InkbunnyExtractor):
     """Extractor for inkbunny user watches"""
     subcategory = "following"
     pattern = (BASE_PATTERN + r"/(?:"
                r"watchlist_process\.php\?mode=watching&user_id=(\d+)|"
-               r"usersviewall\.php\?([^#]+&mode=watching&[^#]+))")
-    test = (
-        (("https://inkbunny.net/watchlist_process.php"
-          "?mode=watching&user_id=20969"), {
-            "pattern": InkbunnyUserExtractor.pattern,
-            "count": ">= 90",
-        }),
-        ("https://inkbunny.net/usersviewall.php?rid=ffffffffff"
-         "&mode=watching&page=1&user_id=20969&orderby=added&namesonly="),
-    )
+               r"usersviewall\.php"
+               r"\?((?:[^#]+&)?mode=watching(?:&[^#]+)?))")
+    example = ("https://inkbunny.net/watchlist_process.php"
+               "?mode=watching&user_id=12345")
 
     def __init__(self, match):
         InkbunnyExtractor.__init__(self, match)
-        self.user_id = match.group(1) or \
-            text.parse_query(match.group(2)).get("user_id")
+        self.user_id = match[1] or \
+            text.parse_query(match[2]).get("user_id")
 
     def items(self):
         url = self.root + "/watchlist_process.php"
@@ -239,14 +253,12 @@ class InkbunnyFollowingExtractor(InkbunnyExtractor):
         data = {"_extractor": InkbunnyUserExtractor}
 
         while True:
-            cnt = 0
             for user in text.extract_iter(
                     page, '<a class="widget_userNameSmall" href="', '"',
                     page.index('id="changethumboriginal_form"')):
-                cnt += 1
                 yield Message.Queue, self.root + user, data
 
-            if cnt < 20:
+            if "<a title='next page' " not in page:
                 return
             params["page"] += 1
             page = self.request(url, params=params).text
@@ -256,25 +268,16 @@ class InkbunnyPostExtractor(InkbunnyExtractor):
     """Extractor for individual Inkbunny posts"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"/s/(\d+)"
-    test = (
-        ("https://inkbunny.net/s/1829715", {
-            "pattern": r"https://[\w.]+\.metapix\.net/files/full"
-                       r"/2626/2626843_soina_dscn2296\.jpg",
-            "content": "cf69d8dddf0822a12b4eef1f4b2258bd600b36c8",
-        }),
-        ("https://inkbunny.net/s/2044094", {
-            "count": 4,
-        }),
-    )
+    example = "https://inkbunny.net/s/12345"
 
     def __init__(self, match):
         InkbunnyExtractor.__init__(self, match)
-        self.submission_id = match.group(1)
+        self.submission_id = match[1]
 
     def posts(self):
         submissions = self.api.detail(({"submission_id": self.submission_id},))
         if submissions[0] is None:
-            raise exception.NotFoundError("submission")
+            raise self.exc.NotFoundError("submission")
         return submissions
 
 
@@ -297,6 +300,7 @@ class InkbunnyAPI():
         params = {
             "submission_ids": ",".join(ids),
             "show_description": "yes",
+            "show_pools": "yes",
         }
 
         submissions = [None] * len(ids)
@@ -320,27 +324,46 @@ class InkbunnyAPI():
         self._call("userrating", params)
 
     def authenticate(self, invalidate=False):
-        username, password = self.extractor._get_auth_info()
+        extr = self.extractor
+        username, password = extr._get_auth_info()
+        if not username:
+            username, password = "guest", ""
         if invalidate:
-            _authenticate_impl.invalidate(username or "guest")
-        if username:
-            self.session_id = _authenticate_impl(self, username, password)
-        else:
-            self.session_id = _authenticate_impl(self, "guest", "")
+            extr.cache_update(self._authenticate_impl, username, None)
+
+        self.session_id = extr.cache(
+            self._authenticate_impl, username, password,
+            _exp=365*86400, _mem=False)
+
+        if username == "guest":
             self.set_allowed_ratings()
+
+    def _authenticate_impl(self, username, password):
+        self.extractor.log.info("Logging in as %s", username)
+
+        url = "https://inkbunny.net/api_login.php"
+        data = {"username": username, "password": password}
+        data = self.extractor.request_json(url, method="POST", data=data)
+
+        if "sid" not in data:
+            raise Extractor.exc.AuthenticationError(data.get("error_message"))
+        return data["sid"]
 
     def _call(self, endpoint, params):
         url = "https://inkbunny.net/api_" + endpoint + ".php"
-        params["sid"] = self.session_id
-        data = self.extractor.request(url, params=params).json()
 
-        if "error_code" in data:
+        while True:
+            params["sid"] = self.session_id
+            data = self.extractor.request_json(url, params=params)
+
+            if "error_code" not in data:
+                return data
+
             if str(data["error_code"]) == "2":
                 self.authenticate(invalidate=True)
-                return self._call(endpoint, params)
-            raise exception.StopExtraction(data.get("error_message"))
+                continue
 
-        return data
+            raise self.extractor.exc.AbortExtraction(data.get("error_message"))
 
     def _pagination_search(self, params):
         params["page"] = 1
@@ -349,6 +372,9 @@ class InkbunnyAPI():
 
         while True:
             data = self._call("search", params)
+            if not data["submissions"]:
+                return
+
             yield from self.detail(data["submissions"])
 
             if data["page"] >= data["pages_count"]:
@@ -357,16 +383,3 @@ class InkbunnyAPI():
                 del params["get_rid"]
                 params["rid"] = data["rid"]
             params["page"] += 1
-
-
-@cache(maxage=360*24*3600, keyarg=1)
-def _authenticate_impl(api, username, password):
-    api.extractor.log.info("Logging in as %s", username)
-
-    url = "https://inkbunny.net/api_login.php"
-    data = {"username": username, "password": password}
-    data = api.extractor.request(url, method="POST", data=data).json()
-
-    if "sid" not in data:
-        raise exception.AuthenticationError(data.get("error_message"))
-    return data["sid"]

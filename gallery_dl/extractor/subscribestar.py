@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2020-2021 Mike Fährmann
+# Copyright 2020-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -9,9 +9,7 @@
 """Extractors for https://www.subscribestar.com/"""
 
 from .common import Extractor, Message
-from .. import text, exception
-from ..cache import cache
-import json
+from .. import text, util
 
 BASE_PATTERN = r"(?:https?://)?(?:www\.)?subscribestar\.(com|adult)"
 
@@ -23,91 +21,183 @@ class SubscribestarExtractor(Extractor):
     directory_fmt = ("{category}", "{author_name}")
     filename_fmt = "{post_id}_{id}.{extension}"
     archive_fmt = "{id}"
-    cookiedomain = "www.subscribestar.com"
-    cookienames = ("auth_token",)
+    cookies_domain = ".subscribestar.com"
+    cookies_names = ("_personalization_id",)
+    _warning = True
 
     def __init__(self, match):
-        tld, self.item = match.groups()
-        if tld == "adult":
+        if match[1] == "adult":
             self.root = "https://subscribestar.adult"
-            self.cookiedomain = "subscribestar.adult"
+            self.cookies_domain = ".subscribestar.adult"
             self.subcategory += "-adult"
         Extractor.__init__(self, match)
+        self.item = match[2]
 
     def items(self):
         self.login()
         for post_html in self.posts():
             media = self._media_from_post(post_html)
-            if not media:
-                continue
             data = self._data_from_post(post_html)
-            yield Message.Directory, data
-            for item in media:
+
+            content = data["content"]
+            if "<html><body>" in content:
+                data["content"] = content = text.extr(
+                    content, "<body>", "</body>")
+            data["title"] = text.unescape(text.rextr(content, "<h1>", "</h1>"))
+
+            yield Message.Directory, "", data
+            for num, item in enumerate(media, 1):
                 item.update(data)
-                text.nameext_from_url(item.get("name") or item["url"], item)
-                yield Message.Url, item["url"], item
+                item["num"] = num
+
+                url = item["url"]
+                if name := (item.get("name") or item.get("original_filename")):
+                    text.nameext_from_name(name, item)
+                else:
+                    text.nameext_from_url(url, item)
+
+                if url[0] == "/":
+                    url = self.root + url
+                yield Message.Url, url, item
 
     def posts(self):
         """Yield HTML content of all relevant posts"""
 
+    def request(self, url, **kwargs):
+        while True:
+            response = Extractor.request(self, url, **kwargs)
+
+            if response.history and (
+                    "/verify_subscriber" in response.url or
+                    "/age_confirmation_warning" in response.url):
+                raise self.exc.AbortExtraction(
+                    "HTTP redirect to " + response.url)
+
+            content = response.content
+            if len(content) < 250 and b">redirected<" in content:
+                url = text.unescape(text.extr(
+                    content, b'href="', b'"').decode())
+                self.log.debug("HTML redirect message for %s", url)
+                continue
+
+            return response
+
     def login(self):
-        if self._check_cookies(self.cookienames):
+        if self.cookies_check(self.cookies_names):
             return
+
         username, password = self._get_auth_info()
         if username:
-            cookies = self._login_impl(username, password)
-            self._update_cookies(cookies)
+            self.cookies_update(self.cache(
+                self._login_impl, (username, self.cookies_domain), password,
+                _exp=28*86400, _mem=False))
 
-    @cache(maxage=28*24*3600, keyarg=1)
+        if self._warning:
+            if not username or not self.cookies_check(self.cookies_names):
+                self.log.warning("no '_personalization_id' cookie set")
+            SubscribestarExtractor._warning = False
+
     def _login_impl(self, username, password):
+        username = username[0]
         self.log.info("Logging in as %s", username)
 
-        url = "https://www.subscribestar.com/session.json"
+        if self.root.endswith(".adult"):
+            self.cookies.set("18_plus_agreement_generic", "true",
+                             domain=self.cookies_domain)
+
+        # load login page
+        url = self.root + "/login"
+        page = self.request(url).text
+
         headers = {
-            "Origin"          : "https://www.subscribestar.com",
-            "Referer"         : "https://www.subscribestar.com/login",
+            "Accept": "*/*;q=0.5, text/javascript, application/javascript, "
+                      "application/ecmascript, application/x-ecmascript",
+            "Referer": self.root + "/login",
+            "X-CSRF-Token": text.unescape(text.extr(
+                page, '<meta name="csrf-token" content="', '"')),
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
         }
-        data = {
-            "utf8"    : "✓",
-            "email"   : username,
-            "password": password,
-        }
 
-        response = self.request(
-            url, method="POST", headers=headers, data=data, fatal=False)
-        if response.json().get("errors"):
-            self.log.debug(response.json()["errors"])
-            raise exception.AuthenticationError()
+        def check_errors(response):
+            if errors := response.json().get("errors"):
+                self.log.debug(errors)
+                try:
+                    msg = f'"{errors.popitem()[1]}"'
+                except Exception:
+                    msg = None
+                raise self.exc.AuthenticationError(msg)
+            return response
 
+        # submit username / email
+        url = self.root + "/session.json"
+        data = {"email": username}
+        response = check_errors(self.request(
+            url, method="POST", headers=headers, data=data, fatal=False))
+
+        # submit password
+        url = self.root + "/session/password.json"
+        data = {"password": password}
+        response = check_errors(self.request(
+            url, method="POST", headers=headers, data=data, fatal=False))
+
+        # return cookies
         return {
             cookie.name: cookie.value
             for cookie in response.cookies
-            if cookie.name.startswith("auth")
         }
 
-    @staticmethod
-    def _media_from_post(html):
+    def _pagination(self, url, params=None):
+        needle_next_page = 'data-role="infinite_scroll-next_page" href="'
+        page = self.request(url, params=params).text
+
+        while True:
+            posts = page.split('<div class="post ')[1:]
+            if not posts:
+                return
+            yield from posts
+
+            url = text.extr(posts[-1], needle_next_page, '"')
+            if not url:
+                return
+            page = self.request_json(self.root + text.unescape(url))["html"]
+
+    def _media_from_post(self, html):
         media = []
 
-        gallery = text.extract(html, 'data-gallery="', '"')[0]
-        if gallery:
-            media.extend(
-                item for item in json.loads(text.unescape(gallery))
-                if "/previews/" not in item["url"]
-            )
+        if gallery := text.extr(html, 'data-gallery="', '"'):
+            for item in util.json_loads(text.unescape(gallery)):
+                if "/previews" in item["url"]:
+                    self._warn_preview()
+                else:
+                    media.append(item)
 
-        attachments = text.extract(
-            html, 'class="uploads-docs"', 'data-role="post-edit_form"')[0]
+        attachments = text.extr(
+            html, 'class="uploads-docs"', 'class="post-edit_form"')
         if attachments:
-            for att in attachments.split('class="doc_preview"')[1:]:
+            for att in text.re(r'class="doc_preview[" ]').split(
+                    attachments)[1:]:
                 media.append({
-                    "id"  : text.parse_int(text.extract(
-                        att, 'data-upload-id="', '"')[0]),
-                    "name": text.unescape(text.extract(
-                        att, 'doc_preview-title">', '<')[0] or ""),
-                    "url" : text.extract(att, 'href="', '"')[0],
+                    "id"  : text.parse_int(text.extr(
+                        att, 'data-upload-id="', '"')),
+                    "name": text.unescape(text.extr(
+                        att, 'doc_preview-title">', '<')),
+                    "url" : text.unescape(text.extr(att, 'href="', '"')),
                     "type": "attachment",
+                })
+
+        audios = text.extr(
+            html, 'class="uploads-audios"', 'class="post-edit_form"')
+        if audios:
+            for audio in text.re(r'class="audio_preview-data[" ]').split(
+                    audios)[1:]:
+                media.append({
+                    "id"  : text.parse_int(text.extr(
+                        audio, 'data-upload-id="', '"')),
+                    "name": text.unescape(text.extr(
+                        audio, 'audio_preview-title">', '<')),
+                    "url" : text.unescape(text.extr(audio, 'src="', '"')),
+                    "type": "audio",
                 })
 
         return media
@@ -119,115 +209,73 @@ class SubscribestarExtractor(Extractor):
             "author_id"  : text.parse_int(extr('data-user-id="', '"')),
             "author_name": text.unescape(extr('href="/', '"')),
             "author_nick": text.unescape(extr('>', '<')),
-            "date"       : self._parse_datetime(text.remove_html(extr(
-                'class="post-date">', '</'))),
-            "content"    : (extr(
-                '<div class="post-content', '<div class="post-uploads')
-                .partition(">")[2]),
+            "date"       : self._parse_datetime(extr(
+                'class="post-date">', '</').rpartition(">")[2]),
+            "content"    : extr(
+                '<div class="post-content" data-role="post_content-text">',
+                '</div><div class="post-uploads for-youtube"').strip(),
+            "tags"       : list(text.extract_iter(extr(
+                '<div class="post_tags for-post">',
+                '<div class="post-actions">'), '?tag=', '"')),
         }
 
     def _parse_datetime(self, dt):
-        date = text.parse_datetime(dt, "%b %d, %Y %I:%M %p")
+        if dt.startswith("Updated on "):
+            dt = dt[11:]
+        date = self.parse_datetime(dt, "%b %d, %Y %I:%M %p")
         if date is dt:
-            date = text.parse_datetime(dt, "%B %d, %Y %I:%M %p")
+            date = self.parse_datetime(dt, "%B %d, %Y %I:%M %p")
         return date
+
+    def _warn_preview(self):
+        self.log.warning("Preview image detected")
+        self._warn_preview = util.noop
 
 
 class SubscribestarUserExtractor(SubscribestarExtractor):
     """Extractor for media from a subscribestar user"""
     subcategory = "user"
-    pattern = BASE_PATTERN + r"/(?!posts/)([^/?#]+)"
-    test = (
-        ("https://www.subscribestar.com/subscribestar", {
-            "count": ">= 20",
-            "pattern": r"https://(star-uploads|ss-uploads-prod)\.s\d+-us-west-"
-                       r"\d+\.amazonaws\.com/uploads(_v2)?/users/11/",
-            "keyword": {
-                "author_id": 11,
-                "author_name": "subscribestar",
-                "author_nick": "SubscribeStar",
-                "content": str,
-                "date"   : "type:datetime",
-                "id"     : int,
-                "post_id": int,
-                "type"   : "re:image|video|attachment",
-                "url"    : str,
-                "?pinned": bool,
-                "?height": int,
-                "?width" : int,
-            },
-        }),
-        ("https://www.subscribestar.com/subscribestar", {
-            "options": (("metadata", True),),
-            "keyword": {"date": "type:datetime"},
-            "range": "1",
-        }),
-        ("https://subscribestar.adult/kanashiipanda", {
-            "range": "21-40",
-            "count": 20,
-        }),
-    )
+    pattern = BASE_PATTERN + r"/(?!posts/)([^/?#]+)(?:\?([^#]+))?"
+    example = "https://www.subscribestar.com/USER"
 
     def posts(self):
-        needle_next_page = 'data-role="infinite_scroll-next_page" href="'
-        page = self.request("{}/{}".format(self.root, self.item)).text
+        _, user, qs = self.groups
+        url = f"{self.root}/{user}"
 
-        while True:
-            posts = page.split('<div class="post ')[1:]
-            if not posts:
-                return
-            yield from posts
+        if qs is None:
+            params = None
+        else:
+            params = text.parse_query(qs)
+            if "tag" in params:
+                self.kwdict["search_tags"] = params["tag"]
 
-            url = text.extract(posts[-1], needle_next_page, '"')[0]
-            if not url:
-                return
-            page = self.request(self.root + text.unescape(url)).json()["html"]
+        return self._pagination(url, params)
 
 
 class SubscribestarPostExtractor(SubscribestarExtractor):
     """Extractor for media from a single subscribestar post"""
     subcategory = "post"
     pattern = BASE_PATTERN + r"/posts/(\d+)"
-    test = (
-        ("https://www.subscribestar.com/posts/102468", {
-            "url": "612da5a98af056dd78dc846fbcfa705e721f6675",
-            "keyword": {
-                "author_id": 11,
-                "author_name": "subscribestar",
-                "author_nick": "SubscribeStar",
-                "content": "re:<h1>Brand Guidelines and Assets</h1>",
-                "date": "dt:2020-05-07 12:33:00",
-                "extension": "jpg",
-                "filename": "8ff61299-b249-47dc-880a-cdacc9081c62",
-                "group": "imgs_and_videos",
-                "height": 291,
-                "id": 203885,
-                "pinned": False,
-                "post_id": 102468,
-                "type": "image",
-                "width": 700,
-            },
-        }),
-        ("https://subscribestar.adult/posts/22950", {
-            "url": "440d745a368e6b3e218415f593a5045f384afa0d",
-            "keyword": {"date": "dt:2019-04-28 07:32:00"},
-        }),
-    )
+    example = "https://www.subscribestar.com/posts/12345"
 
     def posts(self):
-        url = "{}/posts/{}".format(self.root, self.item)
+        url = f"{self.root}/posts/{self.item}"
         return (self.request(url).text,)
 
     def _data_from_post(self, html):
         extr = text.extract_from(html)
         return {
             "post_id"    : text.parse_int(extr('data-id="', '"')),
-            "author_name": text.unescape(extr('href="/', '"')),
+            "date"       : self._parse_datetime(extr(
+                '<div class="section-title_date">', '<')),
+            "content"    : extr(
+                '<div class="post-content" data-role="post_content-text">',
+                '</div><div class="post-uploads for-youtube"').strip(),
+            "tags"       : list(text.extract_iter(extr(
+                '<div class="post_tags for-post">',
+                '<div class="post-actions">'), '?tag=', '"')),
+            "author_name": text.unescape(extr(
+                'class="star_link" href="/', '"')),
             "author_id"  : text.parse_int(extr('data-user-id="', '"')),
             "author_nick": text.unescape(extr('alt="', '"')),
-            "date"       : self._parse_datetime(extr(
-                'class="section-subtitle">', '<')),
-            "content"    : (extr(
-                '<div class="post-content', '<div class="post-uploads')
-                .partition(">")[2]),
         }

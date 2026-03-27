@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2021 Mike Fährmann
+# Copyright 2021-2025 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -21,32 +21,16 @@ class ArchitizerProjectExtractor(GalleryExtractor):
     filename_fmt = "{filename}.{extension}"
     archive_fmt = "{gid}_{num}"
     pattern = r"(?:https?://)?architizer\.com/projects/([^/?#]+)"
-    test = ("https://architizer.com/projects/house-lo/", {
-        "pattern": r"https://architizer-prod\.imgix\.net/media/mediadata"
-                   r"/uploads/.+\.jpg$",
-        "keyword": {
-            "count": 27,
-            "description": str,
-            "firm": "Atelier Lina Bellovicova",
-            "gid": "225496",
-            "location": "Czechia",
-            "num": int,
-            "size": "1000 sqft - 3000 sqft",
-            "slug": "house-lo",
-            "status": "Built",
-            "subcategory": "project",
-            "title": "House LO",
-            "type": "Residential › Private House",
-            "year": "2020",
-        },
-    })
+    example = "https://architizer.com/projects/NAME/"
 
     def __init__(self, match):
-        url = "{}/projects/{}/".format(self.root, match.group(1))
+        url = f"{self.root}/projects/{match[1]}/"
         GalleryExtractor.__init__(self, match, url)
 
     def metadata(self, page):
         extr = text.extract_from(page)
+        extr('id="Pages"', "")
+
         return {
             "title"      : extr("data-name='", "'"),
             "slug"       : extr("data-slug='", "'"),
@@ -70,7 +54,7 @@ class ArchitizerProjectExtractor(GalleryExtractor):
         return [
             (url, None)
             for url in text.extract_iter(
-                page, "property='og:image:secure_url' content='", "?")
+                page, 'property="og:image:secure_url" content="', "?")
         ]
 
 
@@ -80,22 +64,18 @@ class ArchitizerFirmExtractor(Extractor):
     subcategory = "firm"
     root = "https://architizer.com"
     pattern = r"(?:https?://)?architizer\.com/firms/([^/?#]+)"
-    test = ("https://architizer.com/firms/olson-kundig/", {
-        "pattern": ArchitizerProjectExtractor.pattern,
-        "count": ">= 90",
-    })
+    example = "https://architizer.com/firms/NAME/"
 
     def __init__(self, match):
         Extractor.__init__(self, match)
-        self.firm = match.group(1)
+        self.firm = match[1]
 
     def items(self):
-        url = url = "{}/firms/{}/?requesting_merlin=pages".format(
-            self.root, self.firm)
+        url = url = f"{self.root}/firms/{self.firm}/?requesting_merlin=pages"
         page = self.request(url).text
         data = {"_extractor": ArchitizerProjectExtractor}
 
         for project in text.extract_iter(page, '<a href="/projects/', '"'):
             if not project.startswith("q/"):
-                url = "{}/projects/{}".format(self.root, project)
+                url = f"{self.root}/projects/{project}"
                 yield Message.Queue, url, data

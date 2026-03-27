@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright 2018-2020 Mike Fährmann
+# Copyright 2018-2026 Mike Fährmann
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -10,17 +10,16 @@
 
 import hmac
 import time
-import base64
 import random
 import string
 import hashlib
+import binascii
 import urllib.parse
 
 import requests
 import requests.auth
 
 from . import text
-from .cache import cache
 
 
 def nonce(size, alphabet=string.ascii_letters):
@@ -100,7 +99,7 @@ class OAuth1Client(requests.auth.AuthBase):
         key = concat(self.consumer_secret, self.token_secret or "").encode()
         signature = hmac.new(key, message, hashlib.sha1).digest()
 
-        return quote(base64.b64encode(signature).decode())
+        return quote(binascii.b2a_base64(signature)[:-1].decode())
 
 
 class OAuth1API():
@@ -109,6 +108,7 @@ class OAuth1API():
     API_SECRET = None
 
     def __init__(self, extractor):
+        self.exc = extractor.exc
         self.log = extractor.log
         self.extractor = extractor
 
@@ -119,8 +119,8 @@ class OAuth1API():
         key_type = "default" if api_key == self.API_KEY else "custom"
 
         if token is None or token == "cache":
-            key = (extractor.category, api_key)
-            token, token_secret = _token_cache(key)
+            token, token_secret = extractor.cache(
+                _token_cache, (extractor.category, api_key), _mem=False)
 
         if api_key and api_secret and token and token_secret:
             self.log.debug("Using %s OAuth1.0 authentication", key_type)
@@ -138,6 +138,5 @@ class OAuth1API():
         return self.extractor.request(url, **kwargs)
 
 
-@cache(maxage=100*365*24*3600, keyarg=0)
 def _token_cache(key):
     return None, None

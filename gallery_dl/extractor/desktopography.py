@@ -23,7 +23,7 @@ class DesktopographySiteExtractor(DesktopographyExtractor):
     """Extractor for all desktopography exhibitions """
     subcategory = "site"
     pattern = BASE_PATTERN + r"/$"
-    test = ("https://desktopography.net/",)
+    example = "https://desktopography.net/"
 
     def items(self):
         page = self.request(self.root).text
@@ -42,14 +42,14 @@ class DesktopographyExhibitionExtractor(DesktopographyExtractor):
     """Extractor for a yearly desktopography exhibition"""
     subcategory = "exhibition"
     pattern = BASE_PATTERN + r"/exhibition-([^/?#]+)/"
-    test = ("https://desktopography.net/exhibition-2020/",)
+    example = "https://desktopography.net/exhibition-2020/"
 
     def __init__(self, match):
         DesktopographyExtractor.__init__(self, match)
-        self.year = match.group(1)
+        self.year = match[1]
 
     def items(self):
-        url = "{}/exhibition-{}/".format(self.root, self.year)
+        url = f"{self.root}/exhibition-{self.year}/"
         base_entry_url = "https://desktopography.net/portfolios/"
         page = self.request(url).text
 
@@ -71,18 +71,18 @@ class DesktopographyEntryExtractor(DesktopographyExtractor):
     """Extractor for all resolutions of a desktopography wallpaper"""
     subcategory = "entry"
     pattern = BASE_PATTERN + r"/portfolios/([\w-]+)"
-    test = ("https://desktopography.net/portfolios/new-era/",)
+    example = "https://desktopography.net/portfolios/NAME/"
 
     def __init__(self, match):
         DesktopographyExtractor.__init__(self, match)
-        self.entry = match.group(1)
+        self.entry = match[1]
 
     def items(self):
-        url = "{}/portfolios/{}".format(self.root, self.entry)
+        url = f"{self.root}/portfolios/{self.entry}"
         page = self.request(url).text
 
         entry_data = {"entry": self.entry}
-        yield Message.Directory, entry_data
+        yield Message.Directory, "", entry_data
 
         for image_data in text.extract_iter(
                 page,

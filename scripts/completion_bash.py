@@ -48,8 +48,8 @@ for action in option.build_parser()._actions:
             opts.append(opt)
 
 PATH = util.path("data/completion/gallery-dl")
-with open(PATH, "w", encoding="utf-8") as file:
-    file.write(TEMPLATE % {
+with util.lazy(PATH) as fp:
+    fp.write(TEMPLATE % {
         "opts"    : " ".join(opts),
         "diropts" : "|".join(diropts),
         "fileopts": "|".join(fileopts),
